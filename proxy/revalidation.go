@@ -370,8 +370,16 @@ func (s *Service) serveFromCache(
 		bodyBuf.Reset()
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bodyBuf)
+		bodyLen := int64(bodyBuf.Len())
+		if bodyErr != nil && meta.ContentLength > 0 && bodyLen < meta.ContentLength && errors.Is(bodyErr, io.ErrUnexpectedEOF) {
+			putBuffer(bodyBuf)
+			s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+			if invalidateOnLengthMismatch != nil {
+				invalidateOnLengthMismatch()
+			}
+			return fmt.Errorf("%w for %s/%s: got %d bytes, want %d: %w", errCacheBodyLengthMismatch, bucket, key, bodyLen, meta.ContentLength, bodyErr)
+		}
 		if bodyErr == nil {
-			bodyLen := int64(bodyBuf.Len())
 			if meta.ContentLength > 0 && bodyLen != meta.ContentLength {
 				putBuffer(bodyBuf)
 				s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
@@ -406,6 +414,13 @@ func (s *Service) serveFromCache(
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
 	if bodyErr != nil && !cw.committed {
+		if meta.ContentLength > 0 && errors.Is(bodyErr, io.ErrUnexpectedEOF) {
+			s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+			if invalidateOnLengthMismatch != nil {
+				invalidateOnLengthMismatch()
+			}
+			return fmt.Errorf("%w for %s/%s: got 0 bytes, want %d: %w", errCacheBodyLengthMismatch, bucket, key, meta.ContentLength, bodyErr)
+		}
 		return fmt.Errorf("cache body unavailable: %w", bodyErr)
 	}
 	if !cw.committed {

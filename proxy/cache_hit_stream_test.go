@@ -507,17 +507,27 @@ func TestHandleGetObject_ShortBodyCleanupPreservesSameETagReplacement(t *testing
 }
 
 func TestHandleGetObject_EmptyCacheBodyPreservesSameETagReplacement(t *testing.T) {
-	body := cacheTestBodyAboveSmallObjectThreshold("cached body")
+	largeBody := cacheTestBodyAboveSmallObjectThreshold("cached body")
+	shortBody := []byte("cached replacement body")
 	for _, tc := range []struct {
-		name       string
-		legacy     bool
-		revalidate bool
+		name          string
+		legacy        bool
+		revalidate    bool
+		stale         bool
+		unexpectedEOF bool
+		prefixBytes   int
+		body          []byte
 	}{
-		{name: "legacy default", legacy: true},
-		{name: "CAS coordinator", legacy: false},
-		{name: "legacy revalidation fallback", legacy: true, revalidate: true},
+		{name: "legacy default", legacy: true, body: largeBody},
+		{name: "CAS coordinator", legacy: false, body: largeBody},
+		{name: "legacy revalidation fallback", legacy: true, revalidate: true, body: largeBody},
+		{name: "legacy short read error", legacy: true, unexpectedEOF: true, prefixBytes: 1, body: shortBody},
+		{name: "legacy large read error before commit", legacy: true, unexpectedEOF: true, body: largeBody},
+		{name: "legacy revalidation short read error", legacy: true, revalidate: true, unexpectedEOF: true, prefixBytes: 1, body: shortBody},
+		{name: "legacy stale fallback short read error", legacy: true, revalidate: true, stale: true, unexpectedEOF: true, prefixBytes: 1, body: shortBody},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
 			started := make(chan struct{})
 			release := make(chan struct{})
 			var releaseOnce sync.Once
@@ -533,11 +543,17 @@ func TestHandleGetObject_EmptyCacheBodyPreservesSameETagReplacement(t *testing.T
 				var streamErr error
 				streamOnce.Do(func() {
 					first = true
+					if tc.prefixBytes > 0 {
+						_, streamErr = w.Write(body[:tc.prefixBytes])
+					}
 					close(started)
 					select {
 					case <-release:
 					case <-ctx.Done():
 						streamErr = ctx.Err()
+					}
+					if tc.unexpectedEOF && streamErr == nil {
+						streamErr = io.ErrUnexpectedEOF
 					}
 				})
 				if first {
@@ -577,10 +593,14 @@ func TestHandleGetObject_EmptyCacheBodyPreservesSameETagReplacement(t *testing.T
 				},
 			}
 			if tc.revalidate {
-				forwarder.conditionalResp = &http.Response{
-					StatusCode: http.StatusNotModified,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(bytes.NewReader(nil)),
+				if tc.stale {
+					forwarder.conditionalErr = errors.New("upstream revalidation failed")
+				} else {
+					forwarder.conditionalResp = &http.Response{
+						StatusCode: http.StatusNotModified,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(bytes.NewReader(nil)),
+					}
 				}
 				forwarder.forwardFunc = func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
 					upstreamCalls.Add(1)
@@ -606,7 +626,7 @@ func TestHandleGetObject_EmptyCacheBodyPreservesSameETagReplacement(t *testing.T
 			select {
 			case <-started:
 			case <-time.After(2 * time.Second):
-				t.Fatal("empty cache stream did not start")
+				t.Fatal("cache stream did not start")
 			}
 
 			replacement := &cache.CachedObjectMeta{
@@ -625,13 +645,13 @@ func TestHandleGetObject_EmptyCacheBodyPreservesSameETagReplacement(t *testing.T
 				t.Fatalf("HandleGetObject() error = %v, want successful upstream fallback", err)
 			}
 			if tc.revalidate && !forwarder.conditionalCalled {
-				t.Fatal("empty-body fallback did not take the revalidation path")
+				t.Fatal("cache-body fallback did not take the revalidation path")
 			}
 			if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheMiss || w.Header().Get("Content-Length") != strconv.Itoa(len(body)) || !bytes.Equal(w.Body.Bytes(), body) {
-				t.Fatalf("empty-body fallback = %d headers=%v body_bytes=%d, want full MISS", w.Code, w.Header(), w.Body.Len())
+				t.Fatalf("cache-body fallback = %d headers=%v body_bytes=%d, want full MISS", w.Code, w.Header(), w.Body.Len())
 			}
 			if got := upstreamCalls.Load(); got != 1 {
-				t.Fatalf("empty-body fallback upstream calls = %d, want 1", got)
+				t.Fatalf("cache-body fallback upstream calls = %d, want 1", got)
 			}
 
 			current, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key)
