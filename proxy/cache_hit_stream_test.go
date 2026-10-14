@@ -268,7 +268,7 @@ func TestHandleGetObject_LargeCacheHitPostCommitErrorDoesNotFallBack(t *testing.
 		}
 		return streamErr
 	}
-	svc, _, _ := newLargeStreamCacheServiceWithCoordinator(t, body, stream, false)
+	svc, _, _ := newLargeStreamCacheService(t, body, stream)
 
 	var upstreamCalls atomic.Int32
 	svc.forwarder = &mockForwarder{
