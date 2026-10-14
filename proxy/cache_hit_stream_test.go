@@ -58,15 +58,11 @@ func (c *testStreamCacheClient) GetRangeStream(ctx context.Context, key string, 
 }
 
 func newLargeStreamCacheService(t *testing.T, body []byte, stream func(context.Context, string, io.Writer) error) (*Service, *cache.Cache, *cache.CachedObjectMeta) {
-	return newLargeStreamCacheServiceWithCoordinator(t, body, stream, true)
-}
-
-func newLargeStreamCacheServiceWithCoordinator(t *testing.T, body []byte, stream func(context.Context, string, io.Writer) error, legacy bool) (*Service, *cache.Cache, *cache.CachedObjectMeta) {
 	t.Helper()
 
 	cfg := config.NewDefault()
 	cfg.Cache.SetBlockCachingEnabled(false)
-	cfg.Cache.SetLegacyCoordination(legacy)
+	cfg.Cache.SetLegacyCoordination(true)
 	base := cacheclient.NewMemoryCache()
 	client := &testStreamCacheClient{CacheClient: base, stream: stream}
 	store := cache.NewCacheWithClient(client, &cfg.Cache)
@@ -919,7 +915,7 @@ func TestLegacyOverlongHintPreventsIncompleteReplay(t *testing.T) {
 func TestHandleGetObject_ShortCacheBodyUpstreamFailureBeforeCommit(t *testing.T) {
 	objectBody := []byte("complete object body")
 	cacheBody := objectBody[:5]
-	svc, _ := newWholeObjectCacheService(t, objectBody, cacheBody)
+	svc, _ := newWholeObjectCacheServiceWithCoordinator(t, objectBody, cacheBody, true)
 	wantErr := errors.New("upstream request failed")
 	var upstreamCalls atomic.Int32
 	svc.forwarder = &mockForwarder{

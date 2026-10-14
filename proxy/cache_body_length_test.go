@@ -26,26 +26,6 @@ func cacheTestBodyAboveSmallObjectThreshold(pattern string) []byte {
 	return bytes.Repeat(patternBytes, smallObjectThreshold/len(patternBytes)+1)
 }
 
-func newWholeObjectCacheService(t *testing.T, objectBody, cacheBody []byte) (*Service, *cache.CachedObjectMeta) {
-	t.Helper()
-
-	cfg := config.NewDefault()
-	cfg.Cache.SetBlockCachingEnabled(false)
-	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
-	meta := &cache.CachedObjectMeta{
-		Bucket:        "bucket",
-		Key:           "key",
-		ETag:          `"etag"`,
-		ContentType:   "text/plain",
-		ContentLength: int64(len(objectBody)),
-		StatusCode:    http.StatusOK,
-	}
-	if err := store.PutWithMeta(context.Background(), meta.Bucket, meta.Key, meta, cacheBody, 0); err != nil {
-		t.Fatalf("seed whole-object cache: %v", err)
-	}
-	return NewService(&mockForwarder{}, store, cfg), meta
-}
-
 func requestCountForOperation(t *testing.T, operation, status, source string) float64 {
 	t.Helper()
 
@@ -159,7 +139,7 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 	}
 	for _, tt := range proxyCases {
 		t.Run(tt.name, func(t *testing.T) {
-			svc, _ := newWholeObjectCacheService(t, tt.objectBody, tt.cacheBody)
+			svc, _ := newWholeObjectCacheServiceWithCoordinator(t, tt.objectBody, tt.cacheBody, true)
 			var upstreamCalls atomic.Int32
 			svc.forwarder = &mockForwarder{
 				doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
