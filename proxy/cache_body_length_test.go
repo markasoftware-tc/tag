@@ -167,22 +167,22 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			w := httptest.NewRecorder()
 			err := svc.HandleGetObject(w, httptest.NewRequest(http.MethodGet, "/bucket/key", nil))
 			if err != nil {
-				t.Errorf("body-length property %s: HandleGetObject returned %v, want nil", tt.name, err)
+				t.Errorf("whole-object GET %s: HandleGetObject returned %v, want nil", tt.name, err)
 			}
 			if w.Code != http.StatusOK {
-				t.Errorf("body-length property %s: status = %d, want %d", tt.name, w.Code, http.StatusOK)
+				t.Errorf("whole-object GET %s: status = %d, want %d", tt.name, w.Code, http.StatusOK)
 			}
 			if got := w.Header().Get(XCacheHeader); got != tt.wantCacheStatus {
-				t.Errorf("body-length property %s: %s = %q, want %q", tt.name, XCacheHeader, got, tt.wantCacheStatus)
+				t.Errorf("whole-object GET %s: %s = %q, want %q", tt.name, XCacheHeader, got, tt.wantCacheStatus)
 			}
 			if got := w.Header().Get("Content-Length"); got != tt.wantContentLength {
-				t.Errorf("body-length property %s: Content-Length = %q, want %q", tt.name, got, tt.wantContentLength)
+				t.Errorf("whole-object GET %s: Content-Length = %q, want %q", tt.name, got, tt.wantContentLength)
 			}
 			if !bytes.Equal(w.Body.Bytes(), tt.wantBody) {
-				t.Errorf("body-length property %s: returned %d body bytes, want %d", tt.name, w.Body.Len(), len(tt.wantBody))
+				t.Errorf("whole-object GET %s: returned %d body bytes, want %d", tt.name, w.Body.Len(), len(tt.wantBody))
 			}
 			if got := upstreamCalls.Load(); got != tt.wantUpstreamCalls {
-				t.Errorf("body-length property %s: upstream calls = %d, want %d", tt.name, got, tt.wantUpstreamCalls)
+				t.Errorf("whole-object GET %s: upstream calls = %d, want %d", tt.name, got, tt.wantUpstreamCalls)
 			}
 			for i, label := range labels {
 				wantDelta := float64(0)
@@ -190,7 +190,7 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 					wantDelta = 1
 				}
 				if got := requestCountForOperation(t, "GetObject", label.status, label.source); got != before[i]+wantDelta {
-					t.Errorf("body-length property %s: request count %s/%s delta = %v, want %v", tt.name, label.source, label.status, got-before[i], wantDelta)
+					t.Errorf("whole-object GET %s: request count %s/%s delta = %v, want %v", tt.name, label.source, label.status, got-before[i], wantDelta)
 				}
 			}
 		})
@@ -233,35 +233,35 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			w := httptest.NewRecorder()
 			err := svc.HandleGetObject(w, httptest.NewRequest(http.MethodGet, "/bucket/key", nil))
 			if err != nil {
-				t.Errorf("body-length property %s: HandleGetObject returned %v, want nil", tt.name, err)
+				t.Errorf("tiered whole-object GET %s: HandleGetObject returned %v, want nil", tt.name, err)
 			}
 			if w.Code != tt.wantStatus {
-				t.Errorf("body-length property %s: status = %d, want %d", tt.name, w.Code, tt.wantStatus)
+				t.Errorf("tiered whole-object GET %s: status = %d, want %d", tt.name, w.Code, tt.wantStatus)
 			}
 			if got := w.Header().Get(XCacheHeader); got != tt.wantCacheStatus {
-				t.Errorf("body-length property %s: %s = %q, want %q", tt.name, XCacheHeader, got, tt.wantCacheStatus)
+				t.Errorf("tiered whole-object GET %s: %s = %q, want %q", tt.name, XCacheHeader, got, tt.wantCacheStatus)
 			}
 			if got := w.Header().Get("Content-Length"); got != tt.wantContentLength {
-				t.Errorf("body-length property %s: Content-Length = %q, want %q", tt.name, got, tt.wantContentLength)
+				t.Errorf("tiered whole-object GET %s: Content-Length = %q, want %q", tt.name, got, tt.wantContentLength)
 			}
 			if tt.wantNoSuchKey {
 				if !bytes.Contains(w.Body.Bytes(), []byte("<Code>NoSuchKey</Code>")) {
-					t.Errorf("body-length property %s: response did not contain NoSuchKey: %q", tt.name, w.Body.String())
+					t.Errorf("tiered whole-object GET %s: response did not contain NoSuchKey: %q", tt.name, w.Body.String())
 				}
 				if bytes.Contains(w.Body.Bytes(), tt.cacheBody) {
-					t.Errorf("body-length property %s: exposed short cache prefix %q", tt.name, tt.cacheBody)
+					t.Errorf("tiered whole-object GET %s: exposed short cache prefix %q", tt.name, tt.cacheBody)
 				}
 			} else if !bytes.Equal(w.Body.Bytes(), tt.wantBody) {
-				t.Errorf("body-length property %s: returned %d body bytes, want %d", tt.name, w.Body.Len(), len(tt.wantBody))
+				t.Errorf("tiered whole-object GET %s: returned %d body bytes, want %d", tt.name, w.Body.Len(), len(tt.wantBody))
 			}
 			if got := forwards.Load(); got != beforeForwards {
-				t.Errorf("body-length property %s: made %d upstream calls, want none", tt.name, got-beforeForwards)
+				t.Errorf("tiered whole-object GET %s: made %d upstream calls, want none", tt.name, got-beforeForwards)
 			}
 			if got := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal); got != beforeErrors+1 {
-				t.Errorf("body-length property %s: local error count delta = %v, want 1", tt.name, got-beforeErrors)
+				t.Errorf("tiered whole-object GET %s: local error count delta = %v, want 1", tt.name, got-beforeErrors)
 			}
 			if got := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal); got != beforeSuccesses {
-				t.Errorf("body-length property %s: local success count delta = %v, want 0", tt.name, got-beforeSuccesses)
+				t.Errorf("tiered whole-object GET %s: local success count delta = %v, want 0", tt.name, got-beforeSuccesses)
 			}
 		})
 	}
@@ -276,19 +276,19 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		r := httptest.NewRequest(http.MethodHead, "/bucket/key", nil)
 		err := svc.HandleHeadObject(w, r)
 		if err != nil {
-			t.Errorf("body-length property tiered-head-short: HandleHeadObject returned %v, want nil", err)
+			t.Errorf("tiered HEAD with a short body: HandleHeadObject returned %v, want nil", err)
 		}
 		if w.Code != http.StatusNotFound || w.Header().Get(XCacheHeader) != XCacheMiss {
-			t.Errorf("body-length property tiered-head-short: response = %d/%q, want 404/MISS", w.Code, w.Header().Get(XCacheHeader))
+			t.Errorf("tiered HEAD with a short body: response = %d/%q, want 404/MISS", w.Code, w.Header().Get(XCacheHeader))
 		}
 		if got := requestCountForOperation(t, "HeadObject", "error", metrics.SourceLocal); got != beforeErrors+1 {
-			t.Errorf("body-length property tiered-head-short: local error count delta = %v, want 1", got-beforeErrors)
+			t.Errorf("tiered HEAD with a short body: local error count delta = %v, want 1", got-beforeErrors)
 		}
 		if got := requestCountForOperation(t, "HeadObject", "success", metrics.SourceLocal); got != beforeSuccesses {
-			t.Errorf("body-length property tiered-head-short: local success count delta = %v, want 0", got-beforeSuccesses)
+			t.Errorf("tiered HEAD with a short body: local success count delta = %v, want 0", got-beforeSuccesses)
 		}
 		if got := forwards.Load(); got != beforeForwards {
-			t.Errorf("body-length property tiered-head-short: made %d upstream calls, want none", got-beforeForwards)
+			t.Errorf("tiered HEAD with a short body: made %d upstream calls, want none", got-beforeForwards)
 		}
 	})
 
@@ -303,22 +303,22 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		r.Header.Set("If-None-Match", meta.ETag)
 		err := svc.HandleGetObject(w, r)
 		if err != nil {
-			t.Errorf("body-length property tiered-conditional-short: HandleGetObject returned %v, want nil", err)
+			t.Errorf("tiered conditional GET with a short body: HandleGetObject returned %v, want nil", err)
 		}
 		if w.Code != http.StatusNotFound || w.Header().Get(XCacheHeader) != XCacheMiss {
-			t.Errorf("body-length property tiered-conditional-short: response = %d/%q, want 404/MISS", w.Code, w.Header().Get(XCacheHeader))
+			t.Errorf("tiered conditional GET with a short body: response = %d/%q, want 404/MISS", w.Code, w.Header().Get(XCacheHeader))
 		}
 		if !bytes.Contains(w.Body.Bytes(), []byte("<Code>NoSuchKey</Code>")) {
-			t.Errorf("body-length property tiered-conditional-short: response did not contain NoSuchKey: %q", w.Body.String())
+			t.Errorf("tiered conditional GET with a short body: response did not contain NoSuchKey: %q", w.Body.String())
 		}
 		if got := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal); got != beforeErrors+1 {
-			t.Errorf("body-length property tiered-conditional-short: local error count delta = %v, want 1", got-beforeErrors)
+			t.Errorf("tiered conditional GET with a short body: local error count delta = %v, want 1", got-beforeErrors)
 		}
 		if got := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal); got != beforeSuccesses {
-			t.Errorf("body-length property tiered-conditional-short: local success count delta = %v, want 0", got-beforeSuccesses)
+			t.Errorf("tiered conditional GET with a short body: local success count delta = %v, want 0", got-beforeSuccesses)
 		}
 		if got := forwards.Load(); got != beforeForwards {
-			t.Errorf("body-length property tiered-conditional-short: made %d upstream calls, want none", got-beforeForwards)
+			t.Errorf("tiered conditional GET with a short body: made %d upstream calls, want none", got-beforeForwards)
 		}
 	})
 
@@ -328,7 +328,7 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		w := httptest.NewRecorder()
 		err := svc.HandleHeadObject(w, httptest.NewRequest(http.MethodHead, "/bucket/key", nil))
 		if err != nil || w.Code != http.StatusOK || w.Header().Get("Content-Length") != strconv.Itoa(len(objectBody)) {
-			t.Errorf("body-length property tiered-head-exact: response = %d/%q err=%v, want 200 and exact Content-Length", w.Code, w.Header().Get("Content-Length"), err)
+			t.Errorf("tiered HEAD with an exact body: response = %d/%q err=%v, want 200 and exact Content-Length", w.Code, w.Header().Get("Content-Length"), err)
 		}
 	})
 
@@ -340,7 +340,7 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		r.Header.Set("If-None-Match", meta.ETag)
 		err := svc.HandleGetObject(w, r)
 		if err != nil || w.Code != http.StatusNotModified {
-			t.Errorf("body-length property tiered-conditional-exact: response = %d err=%v, want 304", w.Code, err)
+			t.Errorf("tiered conditional GET with an exact body: response = %d err=%v, want 304", w.Code, err)
 		}
 	})
 
@@ -352,10 +352,10 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		r.Header.Set("If-Match", `"not-the-etag"`)
 		err := svc.HandleGetObject(w, r)
 		if err != nil || w.Code != http.StatusPreconditionFailed {
-			t.Errorf("body-length property tiered-ifmatch-short: response = %d err=%v, want 412", w.Code, err)
+			t.Errorf("tiered GET with a failing If-Match: response = %d err=%v, want 412", w.Code, err)
 		}
 		if !bytes.Contains(w.Body.Bytes(), []byte("<Code>PreconditionFailed</Code>")) {
-			t.Errorf("body-length property tiered-ifmatch-short: response did not preserve PreconditionFailed: %q", w.Body.String())
+			t.Errorf("tiered GET with a failing If-Match: response did not preserve PreconditionFailed: %q", w.Body.String())
 		}
 	})
 
@@ -423,29 +423,29 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			responseBody, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if err := <-handlerErr; err != nil {
-				t.Errorf("body-length property %s: HandleGetObject returned %v after commitment", tc.name, err)
+				t.Errorf("overlong whole-object GET %s: HandleGetObject returned %v after commitment", tc.name, err)
 			}
 			if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Length") != strconv.Itoa(len(largeBody)) {
-				t.Errorf("body-length property %s: response = %d Content-Length %q, want 200/%d", tc.name, resp.StatusCode, resp.Header.Get("Content-Length"), len(largeBody))
+				t.Errorf("overlong whole-object GET %s: response = %d Content-Length %q, want 200/%d", tc.name, resp.StatusCode, resp.Header.Get("Content-Length"), len(largeBody))
 			}
 			if tc.wantReadErr {
 				if !errors.Is(readErr, io.ErrUnexpectedEOF) || len(responseBody) != 0 {
-					t.Errorf("body-length property %s: received %d bytes with read error %v, want zero bytes and unexpected EOF", tc.name, len(responseBody), readErr)
+					t.Errorf("overlong whole-object GET %s: received %d bytes with read error %v, want zero bytes and unexpected EOF", tc.name, len(responseBody), readErr)
 				}
 			} else if readErr != nil || !bytes.Equal(responseBody, tc.wantBody) {
-				t.Errorf("body-length property %s: received %d bytes with read error %v, want the advertised body", tc.name, len(responseBody), readErr)
+				t.Errorf("overlong whole-object GET %s: received %d bytes with read error %v, want the advertised body", tc.name, len(responseBody), readErr)
 			}
 			if got := upstreamCalls.Load(); got != 0 {
-				t.Errorf("body-length property %s: upstream calls = %d, want none after commitment", tc.name, got)
+				t.Errorf("overlong whole-object GET %s: upstream calls = %d, want none after commitment", tc.name, got)
 			}
 			if got := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal); got != beforeErrors+1 {
-				t.Errorf("body-length property %s: local error count delta = %v, want 1", tc.name, got-beforeErrors)
+				t.Errorf("overlong whole-object GET %s: local error count delta = %v, want 1", tc.name, got-beforeErrors)
 			}
 			if got := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal); got != beforeSuccesses {
-				t.Errorf("body-length property %s: local success count delta = %v, want 0", tc.name, got-beforeSuccesses)
+				t.Errorf("overlong whole-object GET %s: local success count delta = %v, want 0", tc.name, got-beforeSuccesses)
 			}
 			if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil || found {
-				t.Errorf("body-length property %s: CAS cleanup left metadata found=%v err=%v", tc.name, found, err)
+				t.Errorf("overlong whole-object GET %s: CAS cleanup left metadata found=%v err=%v", tc.name, found, err)
 			}
 		})
 	}
