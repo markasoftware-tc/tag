@@ -523,6 +523,159 @@ func TestHandleGetObject_ShortBodyCleanupPreservesSameETagReplacement(t *testing
 	}
 }
 
+func TestHandleGetObject_EmptyCacheBodyPreservesSameETagReplacement(t *testing.T) {
+	body := cacheTestBodyAboveSmallObjectThreshold("cached body")
+	for _, tc := range []struct {
+		name       string
+		legacy     bool
+		revalidate bool
+	}{
+		{name: "legacy default", legacy: true},
+		{name: "CAS coordinator", legacy: false},
+		{name: "legacy revalidation fallback", legacy: true, revalidate: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseStream := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseStream()
+			cfg := config.NewDefault()
+			cfg.Cache.SetBlockCachingEnabled(false)
+			cfg.Cache.SetLegacyCoordination(tc.legacy)
+			base := cacheclient.NewMemoryCache()
+			var streamOnce sync.Once
+			stream := func(ctx context.Context, key string, w io.Writer) error {
+				first := false
+				var streamErr error
+				streamOnce.Do(func() {
+					first = true
+					close(started)
+					select {
+					case <-release:
+					case <-ctx.Done():
+						streamErr = ctx.Err()
+					}
+				})
+				if first {
+					return streamErr
+				}
+				return base.GetStream(ctx, key, w)
+			}
+			client := &testStreamCacheClient{CacheClient: base, stream: stream}
+			store := cache.NewCacheWithClient(client, &cfg.Cache)
+			meta := &cache.CachedObjectMeta{
+				Bucket:        "bucket",
+				Key:           "key",
+				ETag:          `"etag"`,
+				ContentType:   "text/plain",
+				ContentLength: int64(len(body)),
+				StatusCode:    http.StatusOK,
+			}
+			if err := store.PutWithMeta(context.Background(), meta.Bucket, meta.Key, meta, body, 0); err != nil {
+				t.Fatalf("seed cache: %v", err)
+			}
+			svc := NewService(&mockForwarder{}, store, cfg)
+			var upstreamCalls atomic.Int32
+			forwarder := &mockForwarder{
+				doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+					upstreamCalls.Add(1)
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header: http.Header{
+							"Content-Length": []string{strconv.Itoa(len(body))},
+							"Cache-Control":  []string{"no-store"},
+							"Content-Type":   []string{"text/plain"},
+							"ETag":           []string{meta.ETag},
+						},
+						Body:          io.NopCloser(bytes.NewReader(body)),
+						ContentLength: int64(len(body)),
+					}, nil
+				},
+			}
+			if tc.revalidate {
+				forwarder.conditionalResp = &http.Response{
+					StatusCode: http.StatusNotModified,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader(nil)),
+				}
+				forwarder.forwardFunc = func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+					upstreamCalls.Add(1)
+					w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+					w.Header().Set("Cache-Control", "no-store")
+					w.Header().Set("Content-Type", "text/plain")
+					w.Header().Set("ETag", meta.ETag)
+					w.WriteHeader(http.StatusOK)
+					_, err := w.Write(body)
+					return err
+				}
+			}
+			svc.forwarder = forwarder
+			w := httptest.NewRecorder()
+			done := make(chan error, 1)
+			go func() {
+				r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+				if tc.revalidate {
+					r.Header.Set("Cache-Control", "no-cache")
+				}
+				done <- svc.HandleGetObject(w, r)
+			}()
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("empty cache stream did not start")
+			}
+
+			replacement := &cache.CachedObjectMeta{
+				Bucket:        meta.Bucket,
+				Key:           meta.Key,
+				ETag:          meta.ETag,
+				ContentType:   meta.ContentType,
+				ContentLength: meta.ContentLength,
+				StatusCode:    meta.StatusCode,
+			}
+			if err := store.PutWithMeta(context.Background(), meta.Bucket, meta.Key, replacement, body, 0); err != nil {
+				t.Fatalf("commit same-ETag replacement: %v", err)
+			}
+			releaseStream()
+			if err := <-done; err != nil {
+				t.Fatalf("HandleGetObject() error = %v, want successful upstream fallback", err)
+			}
+			if tc.revalidate && !forwarder.conditionalCalled {
+				t.Fatal("empty-body fallback did not take the revalidation path")
+			}
+			if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheMiss || w.Header().Get("Content-Length") != strconv.Itoa(len(body)) || !bytes.Equal(w.Body.Bytes(), body) {
+				t.Fatalf("empty-body fallback = %d headers=%v body_bytes=%d, want full MISS", w.Code, w.Header(), w.Body.Len())
+			}
+			if got := upstreamCalls.Load(); got != 1 {
+				t.Fatalf("empty-body fallback upstream calls = %d, want 1", got)
+			}
+
+			current, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key)
+			if err != nil || !found || current == nil || current.ETag != meta.ETag {
+				t.Fatalf("same-ETag replacement metadata was removed: current=%+v found=%v err=%v", current, found, err)
+			}
+			var currentBody bytes.Buffer
+			if err := store.GetBodyStream(context.Background(), meta.Bucket, meta.Key, current.BodyDiscriminator(), &currentBody); err != nil {
+				t.Fatalf("read replacement body: %v", err)
+			}
+			if !bytes.Equal(currentBody.Bytes(), body) {
+				t.Errorf("replacement body length = %d, want %d", currentBody.Len(), len(body))
+			}
+			second := httptest.NewRecorder()
+			if err := svc.HandleGetObject(second, httptest.NewRequest(http.MethodGet, "/bucket/key", nil)); err != nil {
+				t.Fatalf("second GET error = %v", err)
+			}
+			if second.Code != http.StatusOK || second.Header().Get(XCacheHeader) != XCacheHit || !bytes.Equal(second.Body.Bytes(), body) {
+				t.Errorf("replacement GET = %d X-Cache=%q body_bytes=%d, want full HIT", second.Code, second.Header().Get(XCacheHeader), second.Body.Len())
+			}
+			if got := upstreamCalls.Load(); got != 1 {
+				t.Errorf("replacement GET caused %d upstream calls, want 1", got)
+			}
+		})
+	}
+}
+
 func TestHandleGetObject_LargeShortCacheBodyInvalidatesBeforeNextGetInCAS(t *testing.T) {
 	body := cacheTestBodyAboveSmallObjectThreshold("cached body")
 	prefix := body[:shortCacheBodyPrefixSize]
@@ -650,6 +803,129 @@ func TestHandleGetObject_RevalidationLargeShortBodyInvalidatesMetadataInCAS(t *t
 				t.Errorf("local success count delta = %v, want 0", got-beforeSuccesses)
 			}
 		})
+	}
+}
+
+func TestLegacyOverlongHintPreventsIncompleteReplay(t *testing.T) {
+	body := cacheTestBodyAboveSmallObjectThreshold("cached body")
+	overlong := append(append([]byte(nil), body...), []byte(" extra")...)
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(false)
+	base := cacheclient.NewMemoryCache()
+	var bodyStreams atomic.Int32
+	var rangeReads atomic.Int32
+	client := &testStreamCacheClient{
+		CacheClient: base,
+		stream: func(ctx context.Context, key string, w io.Writer) error {
+			bodyStreams.Add(1)
+			return base.GetStream(ctx, key, w)
+		},
+		rangeStream: func(ctx context.Context, key string, start, end int64, w io.Writer) error {
+			rangeReads.Add(1)
+			return base.GetRangeStream(ctx, key, start, end, w)
+		},
+	}
+	store := cache.NewCacheWithClient(client, &cfg.Cache)
+	meta := &cache.CachedObjectMeta{
+		Bucket:        "bucket",
+		Key:           "key",
+		ETag:          `"etag"`,
+		ContentType:   "text/plain",
+		ContentLength: int64(len(body)),
+		StatusCode:    http.StatusOK,
+	}
+	if err := store.PutWithMeta(context.Background(), meta.Bucket, meta.Key, meta, overlong, 0); err != nil {
+		t.Fatalf("seed overlong legacy entry: %v", err)
+	}
+	svc := NewService(&mockForwarder{}, store, cfg)
+	var upstreamCalls atomic.Int32
+	forwarder := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusNotModified,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(nil)),
+		},
+		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+			upstreamCalls.Add(1)
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("ETag", meta.ETag)
+			w.WriteHeader(http.StatusOK)
+			_, err := w.Write(body)
+			return err
+		},
+	}
+	svc.forwarder = forwarder
+
+	beforeErrors := requestCountFrom(t, "error", metrics.SourceLocal)
+	beforeSuccesses := requestCountFrom(t, "success", metrics.SourceLocal)
+	handlerErrors := make(chan error, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerErrors <- svc.HandleGetObject(w, r)
+	}))
+	defer server.Close()
+	clientHTTP := &http.Client{Timeout: 5 * time.Second}
+
+	first, err := clientHTTP.Get(server.URL + "/bucket/key")
+	if err != nil {
+		t.Fatalf("first GET: %v", err)
+	}
+	firstBody, firstReadErr := io.ReadAll(first.Body)
+	_ = first.Body.Close()
+	if first.StatusCode != http.StatusOK || first.Header.Get("Content-Length") != strconv.Itoa(len(body)) {
+		t.Fatalf("first response = %d headers=%v, want 200 with advertised length", first.StatusCode, first.Header)
+	}
+	if len(firstBody) != 0 || !errors.Is(firstReadErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("first response read = %d bytes, %v; want empty body and unexpected EOF", len(firstBody), firstReadErr)
+	}
+	if err := <-handlerErrors; err != nil {
+		t.Fatalf("first HandleGetObject: %v", err)
+	}
+	if got := bodyStreams.Load(); got != 1 {
+		t.Fatalf("cache body streams after first GET = %d, want 1", got)
+	}
+	if got := requestCountFrom(t, "error", metrics.SourceLocal); got != beforeErrors+1 {
+		t.Errorf("first local error count delta = %v, want 1", got-beforeErrors)
+	}
+	if got := requestCountFrom(t, "success", metrics.SourceLocal); got != beforeSuccesses {
+		t.Errorf("first local success count delta = %v, want 0", got-beforeSuccesses)
+	}
+	if hinted, err := store.HasBodyLengthMismatch(context.Background(), meta.Bucket, meta.Key, meta.BodyDiscriminator(), meta.ContentLength); err != nil || !hinted {
+		t.Fatalf("legacy length hint = (%v, %v), want (true, nil)", hinted, err)
+	}
+
+	secondRequest, err := http.NewRequest(http.MethodGet, server.URL+"/bucket/key", nil)
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	secondRequest.Header.Set("Cache-Control", "no-cache")
+	second, err := clientHTTP.Do(secondRequest)
+	if err != nil {
+		t.Fatalf("second revalidation GET: %v", err)
+	}
+	secondBody, secondReadErr := io.ReadAll(second.Body)
+	_ = second.Body.Close()
+	if err := <-handlerErrors; err != nil {
+		t.Fatalf("second revalidation HandleGetObject: %v", err)
+	}
+	if !forwarder.conditionalCalled {
+		t.Fatal("second GET did not take the revalidation path")
+	}
+	if secondReadErr != nil || second.StatusCode != http.StatusOK || second.Header.Get(XCacheHeader) != XCacheMiss || second.Header.Get("Content-Length") != strconv.Itoa(len(body)) || !bytes.Equal(secondBody, body) {
+		t.Fatalf("second revalidation response = %d headers=%v body_bytes=%d read_error=%v, want complete 200 MISS", second.StatusCode, second.Header, len(secondBody), secondReadErr)
+	}
+	if got := bodyStreams.Load(); got != 1 {
+		t.Errorf("cache body streams after quarantined retry = %d, want 1", got)
+	}
+	if got := rangeReads.Load(); got != 1 {
+		t.Errorf("range probes after quarantined retry = %d, want 1", got)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Errorf("upstream calls after quarantined retry = %d, want 1", got)
+	}
+	if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil || !found {
+		t.Errorf("legacy metadata should remain until TTL: found=%v err=%v", found, err)
 	}
 }
 

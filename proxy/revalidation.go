@@ -15,7 +15,10 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 )
 
-var errCacheBodyLengthMismatch = errors.New("cache body length mismatch")
+var (
+	errCacheBodyLengthMismatch        = errors.New("cache body length mismatch")
+	errCacheBodyLengthHintUnavailable = errors.New("cache body length hint unavailable")
+)
 
 // revalidateAndServe sends a conditional GET to upstream and serves the result.
 // Supports both full-object and range requests. For range requests, the Range header
@@ -320,9 +323,10 @@ func (s *Service) handleRevalidation200(
 	return copyErr
 }
 
-// serveFromCache serves a whole object from the cache body. Buffered length
-// mismatches return before headers commit; a mismatch found after a streamed
-// response commits is accounted locally and never triggers an upstream append.
+// serveFromCache serves a whole object from the cache body. A retained legacy
+// length hint rechecks the current body before streaming. Buffered mismatches
+// return before headers commit; committed mismatches are accounted locally and
+// never trigger an upstream append.
 func (s *Service) serveFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -337,29 +341,55 @@ func (s *Service) serveFromCache(
 		return nil
 	}
 
+	// A legacy mismatch hint is only a reason to recheck, never proof that a
+	// same-ETag replacement is bad. Keep the check at the shared whole-body
+	// serve boundary so normal, revalidated, and stale reads take the same path.
+	if meta.ContentLength > 0 {
+		hinted, err := s.cache.HasBodyLengthMismatch(ctx, bucket, key, meta.BodyDiscriminator(), meta.ContentLength)
+		if err != nil {
+			return fmt.Errorf("%w: %w", errCacheBodyLengthHintUnavailable, err)
+		}
+		if hinted {
+			matches, err := s.bodyLengthMatches(ctx, bucket, key, meta)
+			if err != nil {
+				return fmt.Errorf("%w: %w", errCacheBodyLengthHintUnavailable, err)
+			}
+			if !matches {
+				s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+				if invalidateOnLengthMismatch != nil {
+					invalidateOnLengthMismatch()
+				}
+				return fmt.Errorf("%w for %s/%s: quarantined body still differs from metadata length %d", errCacheBodyLengthMismatch, bucket, key, meta.ContentLength)
+			}
+		}
+	}
+
 	// Small objects: buffer and verify before committing the response.
 	if meta.ContentLength <= smallObjectThreshold {
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bodyBuf)
-		if bodyErr == nil && bodyBuf.Len() > 0 {
-			if meta.ContentLength > 0 && int64(bodyBuf.Len()) != meta.ContentLength {
-				bodyLen := bodyBuf.Len()
+		if bodyErr == nil {
+			bodyLen := int64(bodyBuf.Len())
+			if meta.ContentLength > 0 && bodyLen != meta.ContentLength {
 				putBuffer(bodyBuf)
+				s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
 				if invalidateOnLengthMismatch != nil {
 					invalidateOnLengthMismatch()
 				}
 				return fmt.Errorf("%w for %s/%s: got %d bytes, want %d", errCacheBodyLengthMismatch, bucket, key, bodyLen, meta.ContentLength)
 			}
-			meta.WriteHeaders(w)
-			writeCacheStatus(w, XCacheHit)
-			w.WriteHeader(meta.StatusCode)
-			n, _ := w.Write(bodyBuf.Bytes())
-			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-			metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
-			putBuffer(bodyBuf)
-			return nil
+			if bodyLen > 0 {
+				meta.WriteHeaders(w)
+				writeCacheStatus(w, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
+				n, _ := w.Write(bodyBuf.Bytes())
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+				metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
+				putBuffer(bodyBuf)
+				return nil
+			}
 		}
 		putBuffer(bodyBuf)
 		// Body unavailable — return error (caller may fall through to upstream)
@@ -379,6 +409,13 @@ func (s *Service) serveFromCache(
 		return fmt.Errorf("cache body unavailable: %w", bodyErr)
 	}
 	if !cw.committed {
+		if bodyErr == nil && meta.ContentLength > 0 {
+			s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+			if invalidateOnLengthMismatch != nil {
+				invalidateOnLengthMismatch()
+			}
+			return fmt.Errorf("%w for %s/%s: got 0 bytes, want %d", errCacheBodyLengthMismatch, bucket, key, meta.ContentLength)
+		}
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
@@ -392,6 +429,7 @@ func (s *Service) serveFromCache(
 			Int64("written_bytes", cw.written).
 			Int64("offered_bytes", cw.offered).
 			Msg("Cache body length mismatch after headers committed")
+		s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
 		if invalidateOnLengthMismatch != nil {
 			invalidateOnLengthMismatch()
 		}

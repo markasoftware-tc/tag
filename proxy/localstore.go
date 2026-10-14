@@ -120,9 +120,9 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		return s.originlessMiss(w, r, operation, start)
 	}
 
-	// Preserve S3 precondition precedence before checking body length. A failed
-	// If-Match/If-Unmodified-Since answers 412 from metadata even when the body
-	// itself is short; it does not claim that the body can be served.
+	// For a body that passed the first-byte presence check, preserve S3
+	// precondition precedence before checking the full length. A failed If-Match
+	// or If-Unmodified-Since answers 412 from metadata even if that body is short.
 	if writePreconditionFailed(w, r, meta) {
 		metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil

@@ -83,11 +83,15 @@ var errCachePopulateDeclined = errors.New("cache populate declined: concurrent w
 // probably fine and we merely could not finish reading it — overwhelmingly a
 // canceled context from a client that disconnected mid-stream (in cluster mode the
 // read is routed over gRPC, so it can arrive as a status code instead of a plain
-// context error), or a briefly unreachable peer. Those leave the entry alone.
+// context error), a briefly unreachable peer, or an unavailable legacy length hint.
+// Those leave the entry alone.
 // Anything else heals the entry; the worst case is one extra miss on a rare I/O
 // error, which repopulates immediately — a far better trade than a 24h loop.
 func bodyGone(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, errCacheBodyLengthHintUnavailable) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -125,6 +129,14 @@ func (s *Service) bodyLengthMatches(ctx context.Context, bucket, key string, met
 		return false, err
 	}
 	return cw.written == 1, nil
+}
+
+func (s *Service) rememberBodyLengthMismatch(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) {
+	if err := s.cache.MarkBodyLengthMismatch(ctx, bucket, key, meta.BodyDiscriminator(), meta.ContentLength); err != nil {
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).
+			Int64("expected_bytes", meta.ContentLength).
+			Msg("Failed to retain cache body length mismatch hint")
+	}
 }
 
 // cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
