@@ -26,19 +26,6 @@ type testStreamCacheClient struct {
 	rangeStream func(context.Context, string, int64, int64, io.Writer) error
 }
 
-type originBodyReader struct {
-	io.ReadCloser
-	onError func(error)
-}
-
-func (r *originBodyReader) Read(p []byte) (int, error) {
-	n, err := r.ReadCloser.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) && r.onError != nil {
-		r.onError(err)
-	}
-	return n, err
-}
-
 type commitTrackingResponseWriter struct {
 	*httptest.ResponseRecorder
 	committed bool
