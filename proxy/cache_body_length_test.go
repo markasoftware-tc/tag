@@ -100,6 +100,16 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			wantRequestStatus: "success",
 		},
 		{
+			name:              "short-empty-small",
+			objectBody:        smallBody,
+			wantBody:          smallBody,
+			wantCacheStatus:   XCacheMiss,
+			wantContentLength: strconv.Itoa(len(smallBody)),
+			wantUpstreamCalls: 1,
+			wantSource:        metrics.SourceUpstream,
+			wantRequestStatus: "success",
+		},
+		{
 			name:              "short-large",
 			objectBody:        largeBody,
 			cacheBody:         largeBody[:shortCacheBodyPrefixSize],
@@ -108,6 +118,16 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			wantContentLength: strconv.Itoa(len(largeBody)),
 			wantSource:        metrics.SourceLocal,
 			wantRequestStatus: "error",
+		},
+		{
+			name:              "short-empty-large",
+			objectBody:        largeBody,
+			wantBody:          largeBody,
+			wantCacheStatus:   XCacheMiss,
+			wantContentLength: strconv.Itoa(len(largeBody)),
+			wantUpstreamCalls: 1,
+			wantSource:        metrics.SourceUpstream,
+			wantRequestStatus: "success",
 		},
 		{
 			name:              "exact-small",
