@@ -322,6 +322,37 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		}
 	})
 
+	t.Run("tiered-range-conditional-short", func(t *testing.T) {
+		objectBody := []byte("conditional range body for local tier")
+		svc, _, forwards, meta := newTieredShortBodyService(t, objectBody, objectBody[:5])
+		beforeErrors := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal)
+		beforeSuccesses := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal)
+		beforeForwards := forwards.Load()
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+		r.Header.Set("Range", "bytes=0-4")
+		r.Header.Set("If-None-Match", meta.ETag)
+		err := svc.HandleGetObject(w, r)
+		if err != nil {
+			t.Errorf("tiered ranged conditional GET with a short body: HandleGetObject returned %v, want nil", err)
+		}
+		if w.Code != http.StatusNotFound || w.Header().Get(XCacheHeader) != XCacheMiss {
+			t.Errorf("tiered ranged conditional GET with a short body: response = %d/%q, want 404/MISS", w.Code, w.Header().Get(XCacheHeader))
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte("<Code>NoSuchKey</Code>")) || bytes.Contains(w.Body.Bytes(), objectBody[:5]) {
+			t.Errorf("tiered ranged conditional GET with a short body: response did not reject the short entry: %q", w.Body.String())
+		}
+		if got := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal); got != beforeErrors+1 {
+			t.Errorf("tiered ranged conditional GET with a short body: local error count delta = %v, want 1", got-beforeErrors)
+		}
+		if got := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal); got != beforeSuccesses {
+			t.Errorf("tiered ranged conditional GET with a short body: local success count delta = %v, want 0", got-beforeSuccesses)
+		}
+		if got := forwards.Load(); got != beforeForwards {
+			t.Errorf("tiered ranged conditional GET with a short body: made %d upstream calls, want none", got-beforeForwards)
+		}
+	})
+
 	t.Run("tiered-head-exact", func(t *testing.T) {
 		objectBody := []byte("exact head body")
 		svc, _, _, _ := newTieredShortBodyService(t, objectBody, objectBody)
@@ -341,6 +372,19 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		err := svc.HandleGetObject(w, r)
 		if err != nil || w.Code != http.StatusNotModified {
 			t.Errorf("tiered conditional GET with an exact body: response = %d err=%v, want 304", w.Code, err)
+		}
+	})
+
+	t.Run("tiered-range-conditional-exact", func(t *testing.T) {
+		objectBody := []byte("exact conditional range body")
+		svc, _, _, meta := newTieredShortBodyService(t, objectBody, objectBody)
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+		r.Header.Set("Range", "bytes=0-4")
+		r.Header.Set("If-None-Match", meta.ETag)
+		err := svc.HandleGetObject(w, r)
+		if err != nil || w.Code != http.StatusNotModified || w.Header().Get(XCacheHeader) != XCacheHit {
+			t.Errorf("tiered ranged conditional GET with an exact body: response = %d/%q err=%v, want 304/HIT", w.Code, w.Header().Get(XCacheHeader), err)
 		}
 	})
 
