@@ -19,6 +19,13 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 )
 
+const shortCacheBodyPrefixSize = smallObjectThreshold / 2
+
+func cacheTestBodyAboveSmallObjectThreshold(pattern string) []byte {
+	patternBytes := []byte(pattern)
+	return bytes.Repeat(patternBytes, smallObjectThreshold/len(patternBytes)+1)
+}
+
 func newWholeObjectCacheService(t *testing.T, objectBody, cacheBody []byte) (*Service, *cache.CachedObjectMeta) {
 	t.Helper()
 
@@ -69,7 +76,7 @@ func newTieredShortBodyService(t *testing.T, objectBody, cacheBody []byte) (*Ser
 
 func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 	smallBody := []byte("small cache body")
-	largeBody := bytes.Repeat([]byte("cached body"), 8192)
+	largeBody := cacheTestBodyAboveSmallObjectThreshold("cached body")
 	proxyCases := []struct {
 		name              string
 		objectBody        []byte
@@ -95,8 +102,8 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		{
 			name:              "short-large",
 			objectBody:        largeBody,
-			cacheBody:         largeBody[:32768],
-			wantBody:          largeBody[:32768],
+			cacheBody:         largeBody[:shortCacheBodyPrefixSize],
+			wantBody:          largeBody[:shortCacheBodyPrefixSize],
 			wantCacheStatus:   XCacheHit,
 			wantContentLength: strconv.Itoa(len(largeBody)),
 			wantSource:        metrics.SourceLocal,
@@ -217,11 +224,11 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 		{
 			name:              "tiered-short-large",
 			objectBody:        largeBody,
-			cacheBody:         largeBody[:32768],
+			cacheBody:         largeBody[:shortCacheBodyPrefixSize],
 			wantStatus:        http.StatusOK,
 			wantCacheStatus:   XCacheHit,
 			wantContentLength: strconv.Itoa(len(largeBody)),
-			wantBody:          largeBody[:32768],
+			wantBody:          largeBody[:shortCacheBodyPrefixSize],
 		},
 	}
 	for _, tt := range tieredCases {
