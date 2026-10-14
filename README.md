@@ -145,6 +145,8 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 2. **Cache Hit**: Returns cached object with `X-Cache: HIT` header
 3. **Cache Miss**: Forwards request to upstream Tigris, caches response, returns with `X-Cache: MISS`
 
+For positive-length whole-object cache hits, TAG checks the cache stream length against metadata. In transparent and signing modes, a short buffered GET falls back to upstream before headers commit. If that fallback fails before upstream headers arrive, TAG returns the error without committing the cached prefix. A committed short or overlong stream is counted as a local error and is not followed by an upstream body. Proxy HEAD and metadata-based conditional 304 responses retain their existing behavior. Tiered local GETs have no upstream body fallback: a buffered length mismatch returns the authoritative `NoSuchKey` miss, while a committed short or overlong stream is counted as an error and is not replaced. Positive-length tiered HEAD and conditional 304 responses verify the cached body length before answering from metadata. Version-guarded cleanup removes the observed row in CAS mode. The default legacy proxy coordinator refuses versioned deletion, so a damaged row may remain until replaced or expired; each subsequent GET still checks its length.
+
 ### Request Coalescing
 
 When multiple concurrent requests arrive for the same uncached object:

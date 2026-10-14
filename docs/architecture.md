@@ -206,6 +206,10 @@ Client                 TAG                    Embedded Cache
   │  X-Cache: HIT       │                       │
 ```
 
+For a positive-length whole-object cache entry, TAG checks the cache stream length against metadata before counting a local GET as successful. In transparent and signing modes, a short buffered GET falls back upstream before response headers commit. If upstream fails before headers arrive, TAG returns the error without committing the cached prefix. A large stream may already be committed when a short or overlong mismatch is detected; TAG records a local error and does not append upstream bytes. Version-guarded cleanup removes the observed metadata row in CAS mode. The default legacy proxy coordinator refuses versioned deletion, so a damaged row may remain until replacement or expiry; later GETs still check the length. Proxy HEAD and metadata-based conditional 304 responses retain their existing metadata behavior.
+
+Tiered local reads have no upstream body fallback. A buffered length mismatch returns the authoritative `NoSuchKey` miss without cached bytes; a committed short or overlong stream is recorded as a local error without an upstream append. Positive-length tiered HEAD and conditional 304 responses also verify the exact body length with a final-byte range probe before returning metadata. Zero-length and unknown-length objects retain their existing paths. Range and block-cache reads use separate helpers.
+
 ### GET Object (Cache Miss)
 
 ```text
@@ -228,6 +232,8 @@ Client                 TAG                    Embedded Cache         Tigris
   │  200 OK + body      │                       │                    │
   │  X-Cache: MISS      │                       │                    │
 ```
+
+If an upstream fetch fails before response headers are published, TAG returns the error before committing a success response.
 
 ### GET Object (Cluster Mode - Remote Key)
 

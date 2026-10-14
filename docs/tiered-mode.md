@@ -21,6 +21,8 @@ what makes the entry visible. `If-Match`/`If-None-Match` are honored; GET,
 HEAD, and DELETE are served entirely locally. Reads and writes of small
 objects generate zero upstream traffic.
 
+For a positive-length whole-object local hit, TAG checks the cache stream length against metadata. A buffered length mismatch found before GET headers commit is discarded; TAG attempts version-guarded metadata cleanup, records a local request error, and returns the authoritative `NoSuchKey` miss so the caller can fall back to its system of record. If a large local body is found short or overlong after streaming commits headers, the response cannot be replaced: TAG records a local request error, attempts version-guarded metadata cleanup, and does not append an upstream body. Cleanup is best effort. Positive-length HEAD and conditional 304 responses also verify the exact body length with a final-byte range probe before answering from metadata; a confirmed mismatch returns the authoritative `NoSuchKey` miss instead of implying that the local body is servable.
+
 **Large objects are the upstream tier.** The PUT passes through to upstream and
 TAG stores a metadata marker locally. HEAD answers from the marker; GET
 forwards for the body — the mode's only body traffic. DELETE forwards and

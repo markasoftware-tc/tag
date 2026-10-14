@@ -369,10 +369,10 @@ func (c *legacyCoordinator) tombstoneTimestamp(ctx context.Context, bucket, key 
 }
 
 // deleteMetaIfVersion is a CAS-strength identity delete: legacy coordination
-// stores no versions (its tokens are wall-clock stamps never persisted with
-// the row), so there is nothing to compare the caller's token against and the
-// only safe answer is to refuse. Its sole caller (the tiered cleanup repair)
-// runs under CAS coordination by construction — tiered mode rejects legacy.
+// stores no versions (its tokens are wall-clock stamps never persisted with the
+// row), so there is nothing to compare the caller's token against and the only
+// safe answer is to refuse. Callers treat this as best-effort cleanup rather
+// than risk deleting a same-ETag replacement through a non-atomic comparison.
 func (c *legacyCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
 	return false, nil
 }

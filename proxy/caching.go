@@ -102,6 +102,31 @@ func bodyGone(err error) bool {
 	return true
 }
 
+// bodyLengthMatches checks a positive, declared whole-body length without
+// reading the entire body. The inclusive range [length-1,length] yields one
+// byte for an exact body, no bytes for a short body, and two for an overlong
+// body. The in-memory client reports an out-of-range start as InvalidArgument;
+// the range is valid by construction here, so that response proves the body is
+// shorter than its metadata.
+func (s *Service) bodyLengthMatches(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (bool, error) {
+	if meta.ContentLength <= 0 {
+		return false, nil
+	}
+
+	cw := &countingWriter{w: io.Discard}
+	err := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), meta.ContentLength-1, meta.ContentLength, cw)
+	if err != nil {
+		if errors.Is(err, cache.ErrNotFound) {
+			return false, nil
+		}
+		if st, ok := status.FromError(err); ok && st.Code() == codes.InvalidArgument {
+			return false, nil
+		}
+		return false, err
+	}
+	return cw.written == 1, nil
+}
+
 // cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
 // Returns at least cacheWriteTimeout (60s), scaling up for large objects.
 func cacheWriteTimeoutForSize(contentLength int64) time.Duration {
