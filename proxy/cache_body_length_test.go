@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -385,8 +386,8 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			cfg.Cache.SetBlockCachingEnabled(false)
 			cfg.Cache.SetLegacyCoordination(false)
 			base := cacheclient.NewMemoryCache()
-			client := &testStreamCacheClient{CacheClient: base, stream: stream}
-			store := cache.NewCacheWithClient(client, &cfg.Cache)
+			cacheClient := &testStreamCacheClient{CacheClient: base, stream: stream}
+			store := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
 			meta := &cache.CachedObjectMeta{
 				Bucket:        "bucket",
 				Key:           "key",
