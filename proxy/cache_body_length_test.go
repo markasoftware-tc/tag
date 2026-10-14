@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	cacheclient "github.com/tigrisdata/ocache/client"
@@ -356,4 +357,95 @@ func TestHandleGetObject_CacheBodyLength(t *testing.T) {
 			t.Errorf("body-length property tiered-ifmatch-short: response did not preserve PreconditionFailed: %q", w.Body.String())
 		}
 	})
+
+	for _, tc := range []struct {
+		name        string
+		splitWrite  bool
+		wantBody    []byte
+		wantReadErr bool
+	}{
+		{name: "overlong-whole-chunk", wantReadErr: true},
+		{name: "overlong-second-chunk", splitWrite: true, wantBody: largeBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := []byte(" extra")
+			overlong := append(append([]byte(nil), largeBody...), extra...)
+			stream := func(_ context.Context, _ string, w io.Writer) error {
+				if tc.splitWrite {
+					if _, err := w.Write(largeBody); err != nil {
+						return err
+					}
+					_, err := w.Write(extra)
+					return err
+				}
+				_, err := w.Write(overlong)
+				return err
+			}
+			cfg := config.NewDefault()
+			cfg.Cache.SetBlockCachingEnabled(false)
+			cfg.Cache.SetLegacyCoordination(false)
+			base := cacheclient.NewMemoryCache()
+			client := &testStreamCacheClient{CacheClient: base, stream: stream}
+			store := cache.NewCacheWithClient(client, &cfg.Cache)
+			meta := &cache.CachedObjectMeta{
+				Bucket:        "bucket",
+				Key:           "key",
+				ETag:          `"etag"`,
+				ContentType:   "text/plain",
+				ContentLength: int64(len(largeBody)),
+				StatusCode:    http.StatusOK,
+			}
+			if err := store.PutWithMeta(context.Background(), meta.Bucket, meta.Key, meta, largeBody, 0); err != nil {
+				t.Fatalf("seed CAS cache: %v", err)
+			}
+			svc := NewService(&mockForwarder{}, store, cfg)
+			var upstreamCalls atomic.Int32
+			svc.forwarder = &mockForwarder{
+				doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+					upstreamCalls.Add(1)
+					return nil, errors.New("unexpected upstream request after commitment")
+				},
+			}
+			beforeErrors := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal)
+			beforeSuccesses := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal)
+			handlerErr := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handlerErr <- svc.HandleGetObject(w, r)
+			}))
+			defer server.Close()
+
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Get(server.URL + "/bucket/key")
+			if err != nil {
+				t.Fatalf("HTTP GET: %v", err)
+			}
+			responseBody, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err := <-handlerErr; err != nil {
+				t.Errorf("body-length property %s: HandleGetObject returned %v after commitment", tc.name, err)
+			}
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Length") != strconv.Itoa(len(largeBody)) {
+				t.Errorf("body-length property %s: response = %d Content-Length %q, want 200/%d", tc.name, resp.StatusCode, resp.Header.Get("Content-Length"), len(largeBody))
+			}
+			if tc.wantReadErr {
+				if !errors.Is(readErr, io.ErrUnexpectedEOF) || len(responseBody) != 0 {
+					t.Errorf("body-length property %s: received %d bytes with read error %v, want zero bytes and unexpected EOF", tc.name, len(responseBody), readErr)
+				}
+			} else if readErr != nil || !bytes.Equal(responseBody, tc.wantBody) {
+				t.Errorf("body-length property %s: received %d bytes with read error %v, want the advertised body", tc.name, len(responseBody), readErr)
+			}
+			if got := upstreamCalls.Load(); got != 0 {
+				t.Errorf("body-length property %s: upstream calls = %d, want none after commitment", tc.name, got)
+			}
+			if got := requestCountForOperation(t, "GetObject", "error", metrics.SourceLocal); got != beforeErrors+1 {
+				t.Errorf("body-length property %s: local error count delta = %v, want 1", tc.name, got-beforeErrors)
+			}
+			if got := requestCountForOperation(t, "GetObject", "success", metrics.SourceLocal); got != beforeSuccesses {
+				t.Errorf("body-length property %s: local success count delta = %v, want 0", tc.name, got-beforeSuccesses)
+			}
+			if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil || found {
+				t.Errorf("body-length property %s: CAS cleanup left metadata found=%v err=%v", tc.name, found, err)
+			}
+		})
+	}
 }
