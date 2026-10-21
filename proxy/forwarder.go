@@ -80,44 +80,6 @@ type RequestForwarder interface {
 	DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error)
 }
 
-// completionAccessKeyValidator identifies a caller only after the forwarder's
-// local authentication and, where available, bucket-authorization checks pass.
-type completionAccessKeyValidator interface {
-	authenticatedCompletionAccessKey(r *http.Request) (accessKey string, ok bool)
-}
-
-// completionAccessKeyAtRequestStart snapshots the caller identity before forwarding
-// and can recheck its bucket authorization after a cache read.
-type completionAccessKeyAtRequestStart interface {
-	authenticatedCompletionAccessKeyAtRequestStart(r *http.Request) (accessKey string, ok bool)
-	completionAccessKeyStillAuthorized(accessKey string, r *http.Request) bool
-}
-
-// completionRequestForLocalValidation supplies the unsigned payload marker that
-// presigned SigV4 validation expects without changing the request sent upstream.
-func completionRequestForLocalValidation(r *http.Request) (*http.Request, bool) {
-	if r.Header.Get("X-Amz-Content-Sha256") != "" {
-		return r, true
-	}
-	if !auth.IsPresignedRequest(r) {
-		return r, false
-	}
-	authInfo, err := auth.ParseAuthInfo(r)
-	if err != nil || !authInfo.IsPresigned {
-		return r, false
-	}
-	for _, header := range authInfo.SignedHeaders {
-		if strings.EqualFold(header, "x-amz-content-sha256") {
-			return r, false
-		}
-	}
-
-	validationRequest := r.Clone(r.Context())
-	validationRequest.Header = r.Header.Clone()
-	validationRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-	return validationRequest, true
-}
-
 // AuthErrorCode represents the type of authentication error.
 type AuthErrorCode int
 
@@ -168,7 +130,8 @@ func mapAuthError(err error) *AuthError {
 		reason = "expired_request"
 		code = ErrCodeExpiredRequest
 	} else if errors.Is(err, auth.ErrMissingAuth) || errors.Is(err, auth.ErrInvalidAuthFormat) ||
-		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) {
+		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) ||
+		errors.Is(err, auth.ErrInvalidExpires) {
 		reason = "malformed_auth"
 		code = ErrCodeMalformedAuth
 	} else {
@@ -200,16 +163,16 @@ var (
 
 // ResponseInterceptor is called after receiving the upstream response but before
 // headers are sent to the client. Used by transparentForwarder to extract signing
-// keys, strip internal headers, and report a client identity authenticated by the
-// response. The originalReq is needed to parse the client's auth info.
-type ResponseInterceptor func(resp *http.Response, originalReq *http.Request) (accessKey string, authenticated bool)
+// keys and strip internal headers from the response.
+// The originalReq parameter is the original client request (needed for parsing auth info).
+type ResponseInterceptor func(resp *http.Response, originalReq *http.Request)
 
 // baseForwarder contains shared HTTP execution logic used by both
 // signingForwarder and transparentForwarder.
 type baseForwarder struct {
 	signer              *auth.RequestSigner // Both modes need this for DoFullObjectRequest
 	httpClient          *http.Client
-	responseInterceptor ResponseInterceptor // Optional: called before headers are sent to client
+	responseInterceptor ResponseInterceptor // Optional: called before response headers are written.
 }
 
 // newBaseForwarder creates the shared base with HTTP client and signer.
@@ -233,8 +196,10 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 }
 
 // executeAndStream executes the request and streams the response to the client.
-// originalReq is the original client request, passed to the response interceptor
-// for parsing auth info. It can be nil if no interceptor is set.
+// It returns a body-copy error even though the upstream status has already been
+// committed; the HTTP handler must abort that incomplete response. originalReq is
+// the original client request, passed to the response interceptor for parsing auth
+// info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
 	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false)
 	return err
@@ -243,13 +208,15 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 // executeAndStreamReturningMeta is executeAndStream that also returns the upstream
 // status code and a clone of the upstream response headers. Used by the write-through
 // tee path, which needs the response ETag to build cache metadata for the just-written
-// object without a read-back GET. On a transport error it returns (0, nil, err).
+// object without a read-back GET. On a transport error it returns (0, nil, err); a
+// body-copy error returns the received status and headers with the error.
 func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
 	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
 }
 
 // executeAndStreamWithMeta streams an upstream response and optionally retains an
-// owned copy of its headers for a caller that needs metadata after streaming.
+// owned copy of its headers for a caller that needs metadata after streaming. It
+// returns any body-copy error even though the upstream status is already committed.
 func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
@@ -266,7 +233,7 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 
 	// Run response interceptor before sending headers to client
 	if b.responseInterceptor != nil {
-		_, _ = b.responseInterceptor(resp, originalReq)
+		b.responseInterceptor(resp, originalReq)
 	}
 
 	var respHeaders http.Header
@@ -286,10 +253,11 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
-	return resp.StatusCode, respHeaders, nil
+	return resp.StatusCode, respHeaders, copyErr
 }
 
-// executeAndCapture executes the request, streams to client, and captures the response.
+// executeAndCapture executes the request, writes its response to w, and captures it.
+// w may defer committing the response until the caller has processed the capture.
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, error) {
@@ -306,11 +274,9 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	}
 	defer resp.Body.Close()
 
-	// Run response interceptor before sending headers to client
-	var authenticatedAccessKey string
-	var authenticated bool
+	// Run response interceptor before writing response headers.
 	if b.responseInterceptor != nil {
-		authenticatedAccessKey, authenticated = b.responseInterceptor(resp, originalReq)
+		b.responseInterceptor(resp, originalReq)
 	}
 
 	// Capture response
@@ -318,15 +284,12 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header.Clone(),
 	}
-	if authenticated {
-		capture.authenticatedAccessKey = authenticatedAccessKey
-	}
 
 	// Copy headers to response writer
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	// Capture body while streaming to client
+	// Capture body while writing it to the response writer.
 	var readErr error
 	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
 	if readErr != nil {
@@ -336,8 +299,11 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 		capture.Complete = true
 	}
 
-	// Track bytes out from response body
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	// Track bytes out from response body. A deferred writer counts the bytes
+	// accepted by the client when it later commits the captured response.
+	if _, deferred := w.(responseByteAccountingDeferred); !deferred {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	}
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return capture, nil
@@ -362,7 +328,7 @@ func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int
 
 	// Run response interceptor (e.g., signing key learning, header stripping)
 	if b.responseInterceptor != nil {
-		_, _ = b.responseInterceptor(resp, originalReq)
+		b.responseInterceptor(resp, originalReq)
 	}
 
 	return resp, nil
@@ -622,14 +588,19 @@ func logUpstreamResponse(fwdReq *http.Request, originalReq *http.Request, status
 		Msg("Upstream response")
 }
 
+// responseByteAccountingDeferred marks a writer that buffers a captured response
+// instead of sending it to the client as the upstream body is read. The writer
+// accounts for outbound bytes when it commits the response.
+type responseByteAccountingDeferred interface {
+	deferResponseByteAccounting()
+}
+
 // ResponseCapture holds captured response data.
 type ResponseCapture struct {
 	StatusCode int
 	Headers    http.Header
 	Body       []byte
 	Complete   bool // True if body was fully captured without errors
-
-	authenticatedAccessKey string // Set after local validation or trusted upstream key learning.
 }
 
 // ContentLength returns the content length from headers or body length.
@@ -641,11 +612,12 @@ func (r *ResponseCapture) ContentLength() int64 {
 // For x-amz-meta-* headers, the key is lowercased to match S3 convention,
 // since Go's http.Header canonicalizes keys (e.g., x-amz-meta-foo → X-Amz-Meta-Foo).
 func copyHeaders(dst, src http.Header) {
+	const metadataPrefix = "x-amz-meta-"
+
 	for k, v := range src {
-		lower := strings.ToLower(k)
-		if strings.HasPrefix(lower, "x-amz-meta-") {
+		if len(k) >= len(metadataPrefix) && strings.EqualFold(k[:len(metadataPrefix)], metadataPrefix) {
 			// Use lowercase for metadata headers per S3 convention
-			dst[lower] = v
+			dst[strings.ToLower(k)] = v
 		} else {
 			dst[k] = v
 		}

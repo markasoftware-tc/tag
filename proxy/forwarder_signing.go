@@ -20,6 +20,16 @@ type signingForwarder struct {
 	validator *auth.RequestValidator
 }
 
+// validateRequest keeps signing mode's historical payload-hash requirement.
+// URL-only presigned GETs are enabled for transparent local authentication, not
+// for this forwarder's credential-translating request path.
+func (f *signingForwarder) validateRequest(r *http.Request) (string, error) {
+	if r.Header.Get("X-Amz-Content-Sha256") == "" {
+		return "", auth.ErrMissingContentHash
+	}
+	return f.validator.ValidateRequest(r)
+}
+
 // Forward forwards a request to Tigris and writes the response to the client.
 // Validates the incoming request signature, re-signs with upstream credentials,
 // and streams the response back. If the request uses AWS chunked transfer encoding
@@ -29,7 +39,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return mapAuthError(err)
@@ -72,7 +82,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return 0, nil, "", "", mapAuthError(err)
@@ -100,15 +110,14 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	return status, headers, accessKey, secretKey, err
 }
 
-// ForwardWithCapture forwards request and captures response for caching.
-// Validates and re-signs like Forward, but also captures the response body
-// for caching while streaming to the client.
+// ForwardWithCapture forwards the request and captures the response for caching.
+// It validates and re-signs like Forward, but also retains the response body.
 func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return nil, mapAuthError(err)
@@ -133,34 +142,13 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
-	capture, err := f.executeAndCapture(w, fwdReq, contentLength, nil)
-	if capture != nil && err == nil {
-		capture.authenticatedAccessKey = accessKey
-	}
-	return capture, err
-}
-
-// authenticatedCompletionAccessKey returns the client identity only when its
-// signature and credentials validate locally.
-func (f *signingForwarder) authenticatedCompletionAccessKey(r *http.Request) (string, bool) {
-	validationRequest, ok := completionRequestForLocalValidation(r)
-	if !ok {
-		return "", false
-	}
-	accessKey, err := f.validator.ValidateRequest(validationRequest)
-	if err != nil {
-		return "", false
-	}
-	if _, err := f.credStore.GetSecretKey(accessKey); err != nil {
-		return "", false
-	}
-	return accessKey, accessKey != ""
+	return f.executeAndCapture(w, fwdReq, contentLength, nil)
 }
 
 // ValidateAndGetCredentials validates the request signature and returns credentials.
 // In signing mode, validation is always performed locally — returns AuthValidated on success.
 func (f *signingForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, string, string, error) {
-	accessKey, err := f.validator.ValidateRequest(r)
+	accessKey, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return AuthNotValidated, "", "", mapAuthError(err)

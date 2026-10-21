@@ -147,9 +147,9 @@ func (s *Service) handleRevalidation304(
 	metrics.RecordRevalidationNotModified()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 304 - object unchanged")
 
-	// Serve range or full body from cache. Both serveRangeFromCache (via its
-	// pre-header probe) and serveFromCache report an unresolvable body without
-	// writing headers, so the caller can safely forward to upstream.
+	// Serve range or full body from cache. Both helpers commit only after a
+	// nonempty body write and report an unresolvable body before committing, so
+	// the caller can safely forward to upstream.
 	if rangeHeader != "" {
 		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	}
@@ -261,14 +261,17 @@ func (s *Service) handleRevalidation200(
 	// whole-mode entry that grew into a block-eligible object must not be re-stored as one whole
 	// blob. Sub-block objects keep the whole-body write.
 	cacheErrCh := make(chan error, 1)
-	go func() {
+	if !s.startBackgroundTask(nil, func(parent context.Context) {
+		cacheCtx, cacheCancel := context.WithTimeout(parent, cacheWriteTimeoutForSize(newMeta.ContentLength))
+		defer cacheCancel()
+
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			_, cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, expected)
+			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, newMeta, pr, ttl, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
-				context.Background(), bucket, key, newMeta, pr, ttl, expected,
+				cacheCtx, bucket, key, newMeta, pr, ttl, expected,
 			)
 		}
 		if cacheErr != nil {
@@ -279,7 +282,20 @@ func (s *Service) handleRevalidation200(
 			io.Copy(io.Discard, pr)
 		}
 		cacheErrCh <- cacheErr
-	}()
+	}) {
+		_ = pr.CloseWithError(context.Canceled)
+		_ = pw.CloseWithError(context.Canceled)
+		// Service shutdown has already closed worker admission. Keep the already
+		// committed upstream response independent of cache availability.
+		n, copyErr := io.Copy(w, resp.Body)
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		status := "success"
+		if copyErr != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
+		return copyErr
+	}
 
 	// Foreground: stream to client via TeeReader (also writes to pipe for cache)
 	teeReader := io.TeeReader(resp.Body, pw)
@@ -326,8 +342,12 @@ func (s *Service) serveFromCache(
 		return nil
 	}
 
-	// Small objects: buffer and serve
+	// Small objects: buffer and serve. The read lands in a buffer, so it is bounded
+	// by the size-scaled deadline: a stalled peer fails the serve pre-commit and the
+	// caller falls through upstream.
 	if meta.ContentLength <= smallObjectThreshold {
+		ctx, cancel := context.WithTimeout(ctx, cacheReadTimeoutForSize(meta.ContentLength))
+		defer cancel()
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
@@ -354,9 +374,12 @@ func (s *Service) serveFromCache(
 	// cache produces its first nonempty chunk. This preserves the pre-commit
 	// fallback for an absent or empty body without staging the stream through a
 	// pipe and a second copy.
+	// The client paces this read (the response writer is its sink), so a size-scaled
+	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
+	ctx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
+	defer cancel()
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
-	status := "success"
 	if bodyErr != nil {
 		if !cw.committed {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
@@ -367,14 +390,13 @@ func (s *Service) serveFromCache(
 		// however, so record the request as an error.
 		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to stream cache body after headers committed")
-		status = "error"
 	}
 	if !cw.committed {
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", status, metrics.SourceLocal, time.Since(start).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, bodyErr, time.Since(start).Seconds())
 	return nil
 }
 

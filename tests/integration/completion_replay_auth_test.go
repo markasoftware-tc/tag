@@ -122,6 +122,10 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	defer env.Close()
 
 	if transparent {
+		// Replay binds to a principal TAG can validate locally: learned signing keys
+		// plus a bucket grant, which only a successful object read establishes. Seed
+		// both principals as if they had already read from the bucket.
+		seedTransparentPrincipal(t, env, completionReplayAccessA, completionReplaySecretA, bucket)
 		seedTransparentPrincipal(t, env, completionReplayAccessB, completionReplaySecretB, bucket)
 		// Exercise the cache's bucket dimension even when the same principal is
 		// authorized for both buckets.
@@ -137,6 +141,11 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	unbound := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUnboundID, completionReplayAccessA, completionReplaySecretA, false, false)
 	assertCompletionReplayDenied(t, "completion without a saved caller identity", unbound, unboundEntry)
 	assertCompletionReplayForwarded(t, "completion without a saved caller identity", unbound, completionCalls.Load(), before, http.StatusForbidden)
+	if transparent {
+		// The forwarded denial revoked the caller's bucket grant; restore it so the
+		// completion below is made by a principal TAG can still validate locally.
+		env.AuthzCache.Grant(completionReplayAccessA, bucket)
+	}
 
 	before = completionCalls.Load()
 	first := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
@@ -256,16 +265,21 @@ func testColdCompletionReplay(t *testing.T) {
 	if got := upstream.completionCalls.Load(); got != 1 {
 		t.Fatalf("cold-auth completion made %d upstream calls; want one", got)
 	}
-	if !env.DerivedKeyStore.HasKey(completionReplayAccessA) || !env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
-		t.Fatal("successful upstream response did not teach local signing and bucket authorization state")
+	if !env.DerivedKeyStore.HasKey(completionReplayAccessA) {
+		t.Fatal("successful upstream response did not teach local signing keys")
+	}
+	// A successful write teaches signing keys but grants no bucket authorization;
+	// only a successful object read does. The caller could not be validated locally
+	// at request start, so the completion was not bound to a principal and is not
+	// replayable: the same caller's retry goes upstream for the authoritative answer.
+	if env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
+		t.Fatal("successful completion granted bucket authorization; only object reads may")
 	}
 
 	before := upstream.completionCalls.Load()
 	retry := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
-	if retry.status != first.status || retry.contentType != first.contentType || retry.etag != first.etag || retry.body != first.body {
-		t.Errorf("cold-auth same-principal retry = %#v; want captured response %#v", retry, first)
-	}
-	assertCompletionReplayCallCount(t, "cold-auth same-principal replay", upstream.completionCalls.Load(), before)
+	assertCompletionReplayDenied(t, "cold-auth same-principal retry", retry, first)
+	assertCompletionReplayForwarded(t, "cold-auth same-principal retry", retry, upstream.completionCalls.Load(), before, http.StatusForbidden)
 }
 
 func testCompletionReplayGrantRevocationDuringRead(t *testing.T) {

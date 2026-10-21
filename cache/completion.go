@@ -19,16 +19,10 @@ const (
 	completionKeyPrefix = "complete:"
 )
 
-// CompletionEntry stores a cached CompleteMultipartUpload response.
+// CompletionEntry stores a cached CompleteMultipartUpload response, bound to the
+// access key that completed the upload. An entry without an access key (written
+// before identity binding existed) is never replayed.
 type CompletionEntry struct {
-	StatusCode int               `json:"status_code"`
-	Headers    map[string]string `json:"headers"`
-	Body       []byte            `json:"body"`
-}
-
-// completionCacheRecord keeps caller identity in the cache's internal record;
-// it is never returned to callers.
-type completionCacheRecord struct {
 	AccessKey  string            `json:"access_key,omitempty"`
 	StatusCode int               `json:"status_code"`
 	Headers    map[string]string `json:"headers"`
@@ -47,11 +41,10 @@ func MakeCompletionKey(bucket, key, uploadId string) string {
 	return completionKeyPrefix + bucket + "|" + key + "|" + uploadId
 }
 
-// GetCompletion retrieves a cached completion response only for a caller that
-// matches the identity stored with the successful completion. The callback is
-// evaluated only when a bound cache entry exists.
-func (c *Cache) GetCompletion(ctx context.Context, bucket, key, uploadId string, callerAccessKey func() (string, bool)) (*CompletionEntry, bool, error) {
-	if !c.IsEnabled() {
+// GetCompletion retrieves the cached completion response bound to accessKey.
+// Entries bound to another principal, or to none, are reported as misses.
+func (c *Cache) GetCompletion(ctx context.Context, bucket, key, uploadId, accessKey string) (*CompletionEntry, bool, error) {
+	if !c.IsEnabled() || accessKey == "" {
 		return nil, false, nil
 	}
 
@@ -67,26 +60,23 @@ func (c *Cache) GetCompletion(ctx context.Context, bucket, key, uploadId string,
 		return nil, false, nil
 	}
 
-	var entry completionCacheRecord
+	var entry CompletionEntry
 	if err := json.Unmarshal(data, &entry); err != nil {
 		log.Debug().Err(err).Str("key", cacheKey).Msg("Completion cache decode error")
 		return nil, false, nil // Treat decode errors as cache miss
 	}
-	if entry.AccessKey == "" || callerAccessKey == nil {
-		return nil, false, nil
-	}
-	accessKey, authenticated := callerAccessKey()
-	if !authenticated || accessKey == "" || entry.AccessKey != accessKey {
+	if entry.AccessKey == "" || entry.AccessKey != accessKey {
+		log.Debug().Str("bucket", bucket).Str("uploadId", uploadId).Msg("Completion cache entry bound to another principal")
 		return nil, false, nil
 	}
 
 	log.Debug().Str("bucket", bucket).Str("uploadId", uploadId).Msg("Completion cache hit")
-	return &CompletionEntry{StatusCode: entry.StatusCode, Headers: entry.Headers, Body: entry.Body}, true, nil
+	return &entry, true, nil
 }
 
 // PutCompletion stores a completion response in cache, bound to the access key
 // that successfully completed the upload. Responses without an identified
-// principal are not replayable.
+// principal are not stored, so they can never be replayed.
 func (c *Cache) PutCompletion(ctx context.Context, bucket, key, uploadId, accessKey string, statusCode int, headers http.Header, body []byte) error {
 	if !c.IsEnabled() || accessKey == "" {
 		return nil
@@ -100,7 +90,7 @@ func (c *Cache) PutCompletion(ctx context.Context, bucket, key, uploadId, access
 		}
 	}
 
-	entry := completionCacheRecord{
+	entry := CompletionEntry{
 		AccessKey:  accessKey,
 		StatusCode: statusCode,
 		Headers:    headerMap,
