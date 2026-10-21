@@ -1725,18 +1725,33 @@ func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
 // large client range doesn't fan out into hundreds of aligned GETs.
 //
 // Probing uses BlockExistsErr so a transient probe failure (canceled ctx, cluster gRPC blip) is
-// NOT counted as a missing block: it returns that error immediately instead, so a network hiccup
-// can't inflate the missing count into a false amplify-bail (which the full-object caller would
-// then act on by DELETING a still-valid entry).
+// NOT counted as a missing block: the first input-ordered probe error is returned before missing
+// count or amplify-bail decisions, so a network hiccup cannot invalidate a still-valid entry.
 func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64, bailIfMostlyMissing bool, maxFetchFanout int64) error {
 	var missing []int64
-	for i := b0; i <= bK; i++ {
-		present, perr := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
-		if perr != nil {
-			return perr // transient probe failure — abort without bailing or invalidating
+	if s.parallelParquetFooterRangeProbes(bucket, key, meta, b0, bK, maxFetchFanout) && s.parquetFooterProbeSlots != nil {
+		blocks := make([]int64, 0, bK-b0+1)
+		for i := b0; i <= bK; i++ {
+			blocks = append(blocks, i)
 		}
-		if !present {
-			missing = append(missing, i)
+		probes := s.probeParquetFooterBlocks(ctx, bucket, key, meta, blocks, true, true)
+		for i, idx := range blocks {
+			if probes[i].err != nil {
+				return probes[i].err // preserve the first input-ordered transient probe failure
+			}
+			if !probes[i].present {
+				missing = append(missing, idx)
+			}
+		}
+	} else {
+		for i := b0; i <= bK; i++ {
+			present, perr := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
+			if perr != nil {
+				return perr // transient probe failure — abort without bailing or invalidating
+			}
+			if !present {
+				missing = append(missing, i)
+			}
 		}
 	}
 	total := bK - b0 + 1

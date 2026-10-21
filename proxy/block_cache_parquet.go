@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog/log"
 
@@ -51,6 +52,13 @@ const (
 	// Service. Unlike the per-object block cap above, this keeps distinct slow
 	// footer probes from spawning unbounded detached work.
 	maxConcurrentParquetFooterPrefetches = 32
+
+	// Presence probes are independent. Keep each read-triggered scan or matching
+	// foreground Range to two workers; overlapping groups share a service-wide cap.
+	// Existing serial probe paths remain unchanged.
+	maxConcurrentParquetFooterProbeWorkers = 2
+	maxParallelParquetFooterProbeScans     = 1
+	maxConcurrentParquetFooterProbeCalls   = maxConcurrentParquetFooterPrefetches
 
 	// Trigger labels for the prefetch counters. Precision is compared BETWEEN these,
 	// so both the prefetched and the used counter must carry them.
@@ -195,13 +203,13 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 	}
 
 	// Presence decides the rest of the work, so an object whose metadata blocks are
-	// already cached costs nothing beyond the probes.
-	absent := make([]int64, 0, len(blocks))
-	for _, idx := range blocks {
-		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
-			absent = append(absent, idx)
-		}
-	}
+	// already cached costs nothing beyond the probes. Read scans overlap independent
+	// waits only when at least two target blocks are known remote and few scans are
+	// active; local/unknown clients and write warms retain their serial path.
+	parallelProbes := trigger == triggerReadPrefetch &&
+		len(s.parquetFooterPrefetchSlots) <= maxParallelParquetFooterProbeScans &&
+		s.hasTwoRemoteParquetProbeTargets(bucket, key, meta, blocks[0], blocks[len(blocks)-1])
+	absent := s.missingParquetFooterBlocks(ctx, bucket, key, meta, blocks, parallelProbes)
 	if len(absent) == 0 {
 		return true
 	}
@@ -225,6 +233,159 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 		return false
 	}
 	return true
+}
+
+type parquetBlockPresence struct {
+	present bool
+	err     error
+}
+
+// probeParquetFooterBlocks checks each block. Parallel read-triggered probes
+// have a per-scan worker bound and share a service-wide in-flight cap. Results
+// retain input order and preserve each caller's error interpretation.
+func (s *Service) probeParquetFooterBlocks(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blocks []int64, parallel, stopAtFirstError bool) []parquetBlockPresence {
+	results := make([]parquetBlockPresence, len(blocks))
+	if !parallel || len(blocks) < 2 || s.parquetFooterProbeSlots == nil {
+		for i, idx := range blocks {
+			results[i].present, results[i].err = s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, idx)
+			if stopAtFirstError && results[i].err != nil {
+				return results
+			}
+		}
+		return results
+	}
+
+	probeCtx := ctx
+	cancel := func() {}
+	if stopAtFirstError {
+		probeCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	type indexedPresence struct {
+		index  int
+		result parquetBlockPresence
+	}
+	workers := min(len(blocks), maxConcurrentParquetFooterProbeWorkers)
+	jobs := make(chan int, len(blocks))
+	completed := make(chan indexedPresence, len(blocks))
+	for i := range blocks {
+		jobs <- i
+	}
+	close(jobs)
+
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			for i := range jobs {
+				result := parquetBlockPresence{}
+				if err := probeCtx.Err(); err != nil {
+					result.err = err
+				} else {
+					select {
+					case s.parquetFooterProbeSlots <- struct{}{}:
+						if err := probeCtx.Err(); err != nil {
+							result.err = err
+						} else {
+							result.present, result.err = s.cache.BlockExistsErr(probeCtx, bucket, key, meta.ETag, meta.BlockSize, blocks[i])
+						}
+						<-s.parquetFooterProbeSlots
+					case <-probeCtx.Done():
+						result.err = probeCtx.Err()
+					}
+				}
+				completed <- indexedPresence{index: i, result: result}
+			}
+		}()
+	}
+
+	if stopAtFirstError {
+		seen := make([]bool, len(blocks))
+		next := 0
+		for received := 0; received < len(blocks); received++ {
+			probe := <-completed
+			results[probe.index] = probe.result
+			seen[probe.index] = true
+			for next < len(blocks) && seen[next] {
+				if results[next].err != nil {
+					// Preserve the serial path's first input-ordered error without
+					// waiting for later cache reads that may still be stalled.
+					cancel()
+					return results
+				}
+				next++
+			}
+		}
+	} else {
+		for range len(blocks) {
+			probe := <-completed
+			results[probe.index] = probe.result
+		}
+	}
+	group.Wait()
+	return results
+}
+
+// hasTwoRemoteParquetProbeTargets reports whether the cache can confirm at least
+// two remote owners in the contiguous range. Local or unknown locality retains
+// the serial path instead of adding goroutines to fast local cache reads.
+func (s *Service) hasTwoRemoteParquetProbeTargets(bucket, key string, meta *cache.CachedObjectMeta, first, last int64) bool {
+	if s.cache == nil || meta == nil {
+		return false
+	}
+	remote := 0
+	for idx := first; idx <= last; idx++ {
+		local, known := s.cache.IsBlockLocal(bucket, key, meta.ETag, meta.BlockSize, idx)
+		if !known {
+			return false
+		}
+		if !local {
+			remote++
+			if remote >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// parallelParquetFooterRangeProbes identifies a multi-block Parquet Range that
+// reaches the tail while one read-triggered warm is active and the cache confirms
+// at least two remote blocks. Other Range requests keep their existing probe path.
+func (s *Service) parallelParquetFooterRangeProbes(bucket, key string, meta *cache.CachedObjectMeta, b0, bK, maxFetchFanout int64) bool {
+	if s.config == nil || !s.config.Cache.ParquetOptimization || !isParquetKey(key) ||
+		meta == nil || meta.BlockSize <= 0 || meta.ContentLength <= 0 || maxFetchFanout <= 0 || bK <= b0 {
+		return false
+	}
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	if bK != lastBlock || bK-b0+1 > maxParquetFooterPrefetchBlocks+1 {
+		return false
+	}
+	// A tail read installs this marker before the detached scan starts. Reuse
+	// parallel preflight only while that same version's worker is active; unrelated
+	// Parquet ranges retain the existing foreground path.
+	if len(s.parquetFooterPrefetchSlots) > maxParallelParquetFooterProbeScans {
+		return false
+	}
+	versionKey := bucket + "/" + key + "/" + meta.ETag
+	_, active := s.activeBackgroundFetches.Load("pq:" + versionKey)
+	return active && s.hasTwoRemoteParquetProbeTargets(bucket, key, meta, b0, bK)
+}
+
+// missingParquetFooterBlocks checks every footer block and returns absent
+// indexes in input order. Probe errors retain BlockExists' false/absent behavior
+// for background warming.
+func (s *Service) missingParquetFooterBlocks(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blocks []int64, parallel bool) []int64 {
+	probes := s.probeParquetFooterBlocks(ctx, bucket, key, meta, blocks, parallel, false)
+	absent := make([]int64, 0, len(blocks))
+	for i, idx := range blocks {
+		if probes[i].err != nil || !probes[i].present {
+			absent = append(absent, idx)
+		}
+	}
+	return absent
 }
 
 // parquetFooterLength returns the declared metadata length, whether it is valid,

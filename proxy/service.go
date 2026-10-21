@@ -128,6 +128,10 @@ type Service struct {
 	// parquetFooterPrefetchSlots bounds read-triggered scans before they create a
 	// goroutine or marker. Write-triggered warms retain their separate admission path.
 	parquetFooterPrefetchSlots chan struct{}
+	// parquetFooterProbeSlots bounds parallel first-pass Parquet presence calls
+	// across footer scans and overlapping foreground Range preflights. Existing
+	// serial probe paths do not acquire these slots.
+	parquetFooterProbeSlots chan struct{}
 }
 
 // setActiveBroadcasts includes private late-GET broadcasts alongside the manager's keyed broadcasts.
@@ -225,6 +229,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		retierClaims:                make(map[string]int),
 		retierInflight:              make(map[string]context.CancelFunc),
 		parquetFooterPrefetchSlots:  make(chan struct{}, maxConcurrentParquetFooterPrefetches),
+		parquetFooterProbeSlots:     make(chan struct{}, maxConcurrentParquetFooterProbeCalls),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {

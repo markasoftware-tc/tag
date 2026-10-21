@@ -43,6 +43,8 @@ type admissionProbeCacheClient struct {
 	trailerReads int
 }
 
+func (c *admissionProbeCacheClient) IsLocal(string) bool { return false }
+
 func (c *admissionProbeCacheClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
 	c.mu.Lock()
 	c.calls++
@@ -258,11 +260,12 @@ func TestMaybePrefetchParquetFooter_GlobalLimitShedsAndRetriesWithoutCooldown(t 
 	f := newParquetAdmissionFixture(t)
 	f.service.parquetFooterPrefetchSlots = make(chan struct{}, 1)
 	t.Cleanup(f.release)
-	f.seedObject(t, "a.parquet")
+	meta := f.seedObject(t, "a.parquet")
 	f.seedObject(t, "b.parquet")
+	probeCount := min(maxConcurrentParquetFooterProbeWorkers, len(parquetFooterBlocks(meta, admissionTestFooterLen, true)))
 
 	f.serveTail(t, "a.parquet")
-	waitForAdmissionProbeStarts(t, f.started, 1)
+	waitForAdmissionProbeStarts(t, f.started, probeCount)
 	f.serveTail(t, "b.parquet") // the foreground 206 must not wait for the occupied slot
 
 	if got := countBackgroundFetchesWithPrefix(f.service, "pq:"); got != 1 {
@@ -271,8 +274,8 @@ func TestMaybePrefetchParquetFooter_GlobalLimitShedsAndRetriesWithoutCooldown(t 
 	f.client.mu.Lock()
 	active, peak := f.client.active, f.client.peak
 	f.client.mu.Unlock()
-	if active != 1 || peak != 1 {
-		t.Fatalf("blocked remote probes active/peak = %d/%d, want 1/1", active, peak)
+	if active != probeCount || peak != probeCount {
+		t.Fatalf("blocked remote probes active/peak = %d/%d, want %d/%d", active, peak, probeCount, probeCount)
 	}
 	if _, recent := f.service.recentFooterWork.Get("b/b.parquet/\"v1\""); recent {
 		t.Fatal("declined version was cooled down instead of remaining retryable")
@@ -286,7 +289,7 @@ func TestMaybePrefetchParquetFooter_GlobalLimitShedsAndRetriesWithoutCooldown(t 
 	drainAdmissionProbeStarts(f.started)
 
 	f.serveTail(t, "b.parquet")
-	waitForAdmissionProbeStarts(t, f.started, 1)
+	waitForAdmissionProbeStarts(t, f.started, probeCount)
 	waitForBackgroundFetches(t, f.service)
 	if _, recent := f.service.recentFooterWork.Get("b/b.parquet/\"v1\""); !recent {
 		t.Fatal("retried version did not complete and start its cooldown")
@@ -297,16 +300,19 @@ func TestMaybePrefetchParquetFooter_DuplicateReleasesAdmissionSlot(t *testing.T)
 	f := newParquetAdmissionFixture(t)
 	f.service.parquetFooterPrefetchSlots = make(chan struct{}, 2)
 	t.Cleanup(f.release)
-	f.seedObject(t, "a.parquet")
+	meta := f.seedObject(t, "a.parquet")
 	f.seedObject(t, "b.parquet")
+	probeCount := min(maxConcurrentParquetFooterProbeWorkers, len(parquetFooterBlocks(meta, admissionTestFooterLen, true)))
 
 	f.serveTail(t, "a.parquet")
-	waitForAdmissionProbeStarts(t, f.started, 1)
+	waitForAdmissionProbeStarts(t, f.started, probeCount)
 	f.serveTail(t, "a.parquet") // coalesces into the active version
 	if got := countBackgroundFetchesWithPrefix(f.service, "pq:"); got != 1 {
 		t.Fatalf("same-version duplicate changed active markers to %d, want 1", got)
 	}
-	f.serveTail(t, "b.parquet") // requires the duplicate to have returned its spare permit
+	// The duplicate must return its spare permit before this distinct scan starts.
+	f.serveTail(t, "b.parquet")
+	// A second active scan retains the existing serial probe path.
 	waitForAdmissionProbeStarts(t, f.started, 1)
 	if got := countBackgroundFetchesWithPrefix(f.service, "pq:"); got != 2 {
 		t.Fatalf("active read-prefetch markers after distinct trigger = %d, want 2", got)
@@ -314,8 +320,9 @@ func TestMaybePrefetchParquetFooter_DuplicateReleasesAdmissionSlot(t *testing.T)
 	f.client.mu.Lock()
 	active, peak := f.client.active, f.client.peak
 	f.client.mu.Unlock()
-	if active != 2 || peak != 2 {
-		t.Fatalf("blocked remote probes active/peak = %d/%d, want 2/2", active, peak)
+	wantConcurrent := probeCount + 1
+	if active != wantConcurrent || peak != wantConcurrent {
+		t.Fatalf("blocked remote probes active/peak = %d/%d, want %d/%d", active, peak, wantConcurrent, wantConcurrent)
 	}
 
 	f.release()
@@ -436,10 +443,11 @@ func TestWarmParquetFooterOnWrite_IgnoresReadPrefetchLimit(t *testing.T) {
 	f := newParquetAdmissionFixture(t)
 	f.service.parquetFooterPrefetchSlots = make(chan struct{}, 1)
 	t.Cleanup(f.release)
-	f.seedObject(t, "read.parquet")
+	meta := f.seedObject(t, "read.parquet")
+	probeCount := min(maxConcurrentParquetFooterProbeWorkers, len(parquetFooterBlocks(meta, admissionTestFooterLen, true)))
 
 	f.serveTail(t, "read.parquet")
-	waitForAdmissionProbeStarts(t, f.started, 1)
+	waitForAdmissionProbeStarts(t, f.started, probeCount)
 
 	f.service.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/write.parquet", nil), "b", "write.parquet")
 	if _, ok := f.service.activeBackgroundFetches.Load("pqw:b/write.parquet"); !ok {
