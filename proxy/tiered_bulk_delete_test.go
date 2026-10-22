@@ -158,16 +158,18 @@ func assertTieredBulkDeleteObjectUnchanged(t *testing.T, f *tieredBulkDeleteFixt
 func TestTieredBulkDeleteTruncatedFailurePreservesLocalObject(t *testing.T) {
 	const rejectedPrefix = `<DeleteResult><Error><Key>local-key</Key><Code>AccessDenied</Code></Error>`
 	tests := []struct {
-		name    string
-		readErr error
+		name         string
+		responseBody string
+		readErr      error
 	}{
-		{name: "truncated response read", readErr: io.ErrUnexpectedEOF},
-		{name: "fully received malformed result"},
+		{name: "truncated partial failure", responseBody: rejectedPrefix, readErr: io.ErrUnexpectedEOF},
+		{name: "parseable result with response read error", responseBody: `<DeleteResult/>`, readErr: io.ErrUnexpectedEOF},
+		{name: "fully received malformed result", responseBody: rejectedPrefix},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newTieredBulkDeleteFixture(t, rejectedPrefix, tt.readErr, nil)
+			f := newTieredBulkDeleteFixture(t, tt.responseBody, tt.readErr, nil)
 			beforeMeta, beforeVersion, found, err := f.cache.GetMetaWithVersion(context.Background(), tieredBulkDeleteBucket, tieredBulkDeleteKey)
 			if err != nil || !found || beforeMeta == nil {
 				t.Fatalf("capture pre-forward local metadata: found=%t meta=%+v err=%v", found, beforeMeta, err)
@@ -179,8 +181,8 @@ func TestTieredBulkDeleteTruncatedFailurePreservesLocalObject(t *testing.T) {
 			}
 
 			writer := f.delete(t)
-			if writer.Code != http.StatusOK || writer.Body.String() != rejectedPrefix {
-				t.Fatalf("upstream response = %d %q, want captured 200 prefix %q", writer.Code, writer.Body.String(), rejectedPrefix)
+			if writer.Code != http.StatusOK || writer.Body.String() != tt.responseBody {
+				t.Fatalf("upstream response = %d %q, want captured 200 body %q", writer.Code, writer.Body.String(), tt.responseBody)
 			}
 			if !f.body.closed {
 				t.Fatal("transparent forwarder did not close the upstream response body")
