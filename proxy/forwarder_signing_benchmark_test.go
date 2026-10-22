@@ -292,17 +292,9 @@ func (t signingForwarderStreamingUploadBenchmarkTransport) RoundTrip(request *ht
 		return nil, fmt.Errorf("forwarded content length = %d, want %d", request.ContentLength, t.bodyLength)
 	}
 
-	var buf [32 * 1024]byte
-	var got int64
-	for {
-		n, err := request.Body.Read(buf[:])
-		got += int64(n)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
+	got, err := io.Copy(io.Discard, request.Body)
+	if err != nil {
+		return nil, err
 	}
 	if got != t.bodyLength {
 		return nil, fmt.Errorf("forwarded body length = %d, want %d", got, t.bodyLength)
