@@ -111,47 +111,34 @@ func (f *embeddedCacheRangeBenchmarkFixture) verifyWarm(tb testing.TB) {
 	runtime.GC()
 }
 
-// BenchmarkEmbeddedCacheRangeStream measures the public Cache.GetRangeStream
-// operation against the production embedded-client wrapper. Each case uses
-// warmed, valid non-block hits at deterministic random offsets. Run with -cpu=4
-// to model the repository's 64-call range benchmark concurrency.
+// BenchmarkEmbeddedCacheRangeStream measures warmed, valid non-block hits for the
+// documented large-object GET RANGE shape through the embedded-client wrapper.
+// Run with -cpu=4 to model the repository's 64-call range benchmark concurrency.
 func BenchmarkEmbeddedCacheRangeStream(b *testing.B) {
 	oldLogger := log.Logger
 	log.Logger = log.Logger.Level(zerolog.WarnLevel)
 	b.Cleanup(func() { log.Logger = oldLogger })
 
-	cases := []struct {
-		name      string
-		bodySize  int
-		rangeSize int
-	}{
-		{name: "body-128KiB/range-1KiB", bodySize: 128 << 10, rangeSize: 1 << 10},
-		{name: "body-1MiB/range-64KiB", bodySize: 1 << 20, rangeSize: 64 << 10},
-		{name: "body-4MiB/range-1MiB", bodySize: 4 << 20, rangeSize: 1 << 20},
-		{name: "body-256MiB/range-64KiB", bodySize: 256 << 20, rangeSize: 64 << 10},
-	}
-	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			fixture := newEmbeddedCacheRangeBenchmarkFixture(b, tc.bodySize, tc.rangeSize)
-			fixture.verifyWarm(b)
-			b.ReportAllocs()
-			b.ResetTimer()
-			b.SetParallelism(16)
-			var nextWorker atomic.Uint64
-			b.RunParallel(func(pb *testing.PB) {
-				offsetIndex := int(nextWorker.Add(1)-1) % len(fixture.offsets)
-				for pb.Next() {
-					start := fixture.offsets[offsetIndex]
-					offsetIndex++
-					if offsetIndex == len(fixture.offsets) {
-						offsetIndex = 0
-					}
-					if err := fixture.readAt(start, cacheRangeBenchmarkWriter); err != nil {
-						b.Errorf("warmed range read at %d: %v", start, err)
-						return
-					}
+	b.Run("body-256MiB/range-64KiB", func(b *testing.B) {
+		fixture := newEmbeddedCacheRangeBenchmarkFixture(b, 256<<20, 64<<10)
+		fixture.verifyWarm(b)
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.SetParallelism(16)
+		var nextWorker atomic.Uint64
+		b.RunParallel(func(pb *testing.PB) {
+			offsetIndex := int(nextWorker.Add(1)-1) % len(fixture.offsets)
+			for pb.Next() {
+				start := fixture.offsets[offsetIndex]
+				offsetIndex++
+				if offsetIndex == len(fixture.offsets) {
+					offsetIndex = 0
 				}
-			})
+				if err := fixture.readAt(start, cacheRangeBenchmarkWriter); err != nil {
+					b.Errorf("warmed range read at %d: %v", start, err)
+					return
+				}
+			}
 		})
-	}
+	})
 }
