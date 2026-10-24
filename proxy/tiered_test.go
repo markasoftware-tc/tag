@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/tigrisdata/tag/metrics"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2221,5 +2223,140 @@ func TestTieredCleanupDisabledOnNonTigrisEndpoint(t *testing.T) {
 	// The small object is the live, servable local-tier entry regardless.
 	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Code != http.StatusOK || g.Body.String() != "tiny" {
 		t.Fatalf("GET = %d %q, want the local-tier object", g.Code, g.Body.String())
+	}
+}
+
+// diskUsageClient reports a settable local usage so the tiered PUT path can be
+// driven over and under the shed ratio without a real store.
+type diskUsageClient struct {
+	cacheclient.CacheClient
+	used atomic.Int64
+}
+
+func (d *diskUsageClient) DiskUsageBytes() int64 { return d.used.Load() }
+
+// Over the disk budget a small, validated PUT must go upstream with a marker
+// instead of landing in the local tier; under budget it stays local again.
+func TestTieredPutShedsToUpstreamWhenOverDiskBudget(t *testing.T) {
+	mock, forwards, _ := tieredMock()
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 64
+	cfg.Cache.MaxDiskUsageBytes = 1000
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	client := &diskUsageClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	client.used.Store(1100) // 110% of the cap, above the 105% default
+	if w := tieredDo(t, svc, http.MethodPut, "/b/over", "small body", nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d", w.Code)
+	}
+	if n := forwards.Load(); n != 1 {
+		t.Fatalf("forwards after over-budget PUT = %d, want 1 (shed upstream)", n)
+	}
+	meta, found, err := c.GetMeta(context.Background(), "b", "over")
+	if err != nil || !found || meta == nil || !meta.BodyUpstream {
+		t.Fatalf("over-budget PUT must stamp an upstream marker: found=%v err=%v meta=%+v", found, err, meta)
+	}
+
+	client.used.Store(500) // back under budget: local tier resumes
+	if w := tieredDo(t, svc, http.MethodPut, "/b/under", "small body", nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d", w.Code)
+	}
+	if n := forwards.Load(); n != 1 {
+		t.Fatalf("forwards after under-budget PUT = %d, want 1 (stayed local)", n)
+	}
+	meta, found, err = c.GetMeta(context.Background(), "b", "under")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("under-budget PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
+	}
+
+	// A conditional write is never shed: its precondition is evaluated against
+	// the local copy, which upstream cannot see. If-None-Match: * on a new key
+	// must land locally even over budget.
+	client.used.Store(1100)
+	if w := tieredDo(t, svc, http.MethodPut, "/b/conditional", "small body", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusOK {
+		t.Fatalf("conditional PUT status = %d", w.Code)
+	}
+	if n := forwards.Load(); n != 1 {
+		t.Fatalf("forwards after conditional over-budget PUT = %d, want 1 (stayed local)", n)
+	}
+	meta, found, err = c.GetMeta(context.Background(), "b", "conditional")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("conditional PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
+	}
+	// And the precondition still holds against that local copy.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/conditional", "small body", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("second If-None-Match: * PUT status = %d, want 412", w.Code)
+	}
+
+	// Disabled guard: over budget no longer sheds.
+	cfg.Cache.PopulateShedDiskRatio = -1
+	client.used.Store(1100)
+	if w := tieredDo(t, svc, http.MethodPut, "/b/disabled", "small body", nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d", w.Code)
+	}
+	if n := forwards.Load(); n != 1 {
+		t.Fatalf("forwards with shedding disabled = %d, want 1", n)
+	}
+}
+
+// ownerShedClient models an engine whose OWNING node refuses sheddable body
+// writes while over budget: PutStreamSheddable returns cache.ErrPopulateShed
+// when shed is set and otherwise behaves like a plain streamed put.
+type ownerShedClient struct {
+	cacheclient.CacheClient
+	shed atomic.Bool
+}
+
+func (o *ownerShedClient) PutStreamSheddable(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if o.shed.Load() {
+		return cache.ErrPopulateShed
+	}
+	return o.CacheClient.PutStream(ctx, key, r, ttl)
+}
+
+// A body refused by the owning node answers a retryable SlowDown, leaves no
+// local metadata behind, and is counted as a shed, not an error.
+func TestTieredPutOwnerRefusalAnswersSlowDown(t *testing.T) {
+	mock, forwards, _ := tieredMock()
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 64
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	client := &ownerShedClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	shedBefore := testutil.ToFloat64(metrics.CachePopulateDiskShed.WithLabelValues("tiered_put_owner"))
+	client.shed.Store(true)
+	w := tieredDo(t, svc, http.MethodPut, "/b/refused", "small body", nil)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "SlowDown") {
+		t.Fatalf("PUT status = %d body %q, want 503 SlowDown", w.Code, w.Body.String())
+	}
+	if n := forwards.Load(); n != 0 {
+		t.Fatalf("forwards = %d, want 0 (body already consumed; never re-routed upstream)", n)
+	}
+	if _, found, err := c.GetMeta(context.Background(), "b", "refused"); err != nil || found {
+		t.Fatalf("refused PUT must leave no metadata: found=%v err=%v", found, err)
+	}
+	if got := testutil.ToFloat64(metrics.CachePopulateDiskShed.WithLabelValues("tiered_put_owner")) - shedBefore; got != 1 {
+		t.Fatalf("tiered_put_owner shed count delta = %v, want 1", got)
+	}
+
+	client.shed.Store(false)
+	if w := tieredDo(t, svc, http.MethodPut, "/b/accepted", "small body", nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d after the owner recovers", w.Code)
+	}
+	meta, found, err := c.GetMeta(context.Background(), "b", "accepted")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("accepted PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
 	}
 }

@@ -46,6 +46,67 @@ type Cache struct {
 	closed     bool // coord is the meta-key ordering strategy: legacy tombstones (default)
 	// or CAS fences/versions. Selected once at construction; see coordinator.go.
 	coord metaCoordinator
+	// maxDiskUsage is the configured disk cap (0 = none); DiskUsageRatio
+	// reports tracked usage against it when the client can report usage.
+	maxDiskUsage int64
+}
+
+// ErrPopulateShed reports a body write the OWNING store refused because it is
+// over its disk shed ratio (cache.populate_shed_disk_ratio, enforced by the
+// engine at the owner). The object is intact upstream; callers serve it
+// without caching and must never treat this as a cache fault.
+var ErrPopulateShed = errors.New("cache populate shed: owner over disk budget")
+
+// SheddableBodyPutter is implemented by clients whose engine can refuse a body
+// write at the owning node when that node is over budget (ocache
+// PutStreamSheddable). Implementations return ErrPopulateShed for a refusal.
+type SheddableBodyPutter interface {
+	PutStreamSheddable(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error
+}
+
+// OverBudgetClassifier lets a client say which PutStreamSheddable errors are
+// the owner's over-budget refusal; putBody reports those as ErrPopulateShed.
+// A client that returns ErrPopulateShed itself needs no classifier.
+type OverBudgetClassifier interface {
+	IsOverBudget(err error) bool
+}
+
+// putBody writes a BODY or block key through the sheddable path when the client
+// offers one, so an over-budget owner can refuse it before reading the body.
+// Metadata, markers and tombstones never go through here: they must always land.
+func (c *Cache) putBody(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	p, ok := c.client.(SheddableBodyPutter)
+	if !ok {
+		return c.client.PutStream(ctx, key, r, ttlSeconds)
+	}
+	err := p.PutStreamSheddable(ctx, key, r, ttlSeconds)
+	if err == nil || errors.Is(err, ErrPopulateShed) {
+		return err
+	}
+	if cl, ok := c.client.(OverBudgetClassifier); ok && cl.IsOverBudget(err) {
+		return ErrPopulateShed
+	}
+	return err
+}
+
+// DiskUsageReporter is implemented by cache clients that can report the bytes
+// their local store currently holds (the embedded engine's tracked total).
+type DiskUsageReporter interface {
+	DiskUsageBytes() int64
+}
+
+// DiskUsageRatio returns tracked local disk usage as a fraction of the
+// configured cap. ok is false when there is no cap or the client cannot report
+// usage, in which case callers must not shed on it.
+func (c *Cache) DiskUsageRatio() (ratio float64, ok bool) {
+	if c == nil || c.maxDiskUsage <= 0 || c.client == nil {
+		return 0, false
+	}
+	r, isReporter := c.client.(DiskUsageReporter)
+	if !isReporter {
+		return 0, false
+	}
+	return float64(r.DiskUsageBytes()) / float64(c.maxDiskUsage), true
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -54,7 +115,7 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 	ttl := int64(config.DefaultCacheTTL.Seconds())
 	enabled := true // Default to enabled
 	legacy := true  // Default to the legacy coordinator (see coordinator.go)
-	var sizeThreshold int64
+	var sizeThreshold, maxDiskUsage int64
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
@@ -62,6 +123,7 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		enabled = cfg.IsEnabled()
 		legacy = cfg.IsLegacyCoordination()
 		sizeThreshold = cfg.SizeThreshold
+		maxDiskUsage = cfg.MaxDiskUsageBytes
 	}
 	var coord metaCoordinator
 	if legacy {
@@ -70,10 +132,11 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		coord = &casCoordinator{client: client}
 	}
 	return &Cache{
-		client:     client,
-		defaultTTL: ttl,
-		enabled:    enabled,
-		coord:      coord,
+		client:       client,
+		defaultTTL:   ttl,
+		enabled:      enabled,
+		coord:        coord,
+		maxDiskUsage: maxDiskUsage,
 	}
 }
 
@@ -267,7 +330,11 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 	// declared length. A seekable body stays seekable so the store keeps its
 	// retry-with-rewind for it.
 	countedBody, counted := newCountingReader(body)
-	if err := c.client.PutStream(ctx, bodyKey, countedBody, int64(ttl)); err != nil {
+	if err := c.putBody(ctx, bodyKey, countedBody, int64(ttl)); err != nil {
+		if errors.Is(err, ErrPopulateShed) {
+			metrics.RecordCachePopulateDiskShed("populate_owner")
+			return false, err
+		}
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return false, err
 	}
@@ -386,7 +453,7 @@ func (c *Cache) PutBodyStream(ctx context.Context, bucket, key, discriminator st
 	if ttl <= 0 {
 		ttl = c.defaultTTL
 	}
-	return c.client.PutStream(ctx, MakeBodyKey(bucket, key, discriminator), r, ttl)
+	return c.putBody(ctx, MakeBodyKey(bucket, key, discriminator), r, ttl)
 }
 
 // DeleteBody removes one staged or orphaned body by its discriminator. Used
@@ -759,19 +826,27 @@ func (c *Cache) PutBlock(ctx context.Context, bucket, key, etag string, blockSiz
 		if putter, ok := c.client.(blockBytePutter); ok {
 			handled, err := putter.PutBlockBytes(ctx, blockKey, data, int64(ttl))
 			if handled || err != nil {
-				if err != nil {
-					log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
-				}
-				return err
+				return c.blockPutResult(err, bucket, key, blockIdx)
 			}
 		}
 	}
 
-	if err := c.client.PutStream(ctx, blockKey, bytes.NewReader(data), int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+	return c.blockPutResult(c.putBody(ctx, blockKey, bytes.NewReader(data), int64(ttl)), bucket, key, blockIdx)
+}
+
+// blockPutResult classifies a block write's outcome: an owner's over-budget
+// refusal is counted as a shed and passed through as ErrPopulateShed for the
+// caller to treat as "not persisted", never as a cache failure.
+func (c *Cache) blockPutResult(err error, bucket, key string, blockIdx int64) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrPopulateShed) {
+		metrics.RecordCachePopulateDiskShed("block_owner")
 		return err
 	}
-	return nil
+	log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+	return err
 }
 
 // PutBlockStream writes a single block of a block-mode object to cache. Blocks are
@@ -789,11 +864,7 @@ func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, bl
 		ttl = int(c.defaultTTL)
 	}
 	blockKey := MakeBlockKey(bucket, key, etag, blockSize, blockIdx)
-	if err := c.client.PutStream(ctx, blockKey, r, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
-		return err
-	}
-	return nil
+	return c.blockPutResult(c.putBody(ctx, blockKey, r, int64(ttl)), bucket, key, blockIdx)
 }
 
 // PutMetaIfVersion writes only the object metadata (no body), committed under

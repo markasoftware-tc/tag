@@ -44,7 +44,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.19.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.22.3/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -134,6 +134,7 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Kubernetes** — StatefulSet, HPA, and services in [`deploy/kubernetes/`](deploy/kubernetes/); high availability, scaling, and probes in [docs/deploy.md](docs/deploy.md).
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
+- **Upgrades** — meta coordination mode and rolling-upgrade guidance in [docs/deploy.md](docs/deploy.md#upgrades-and-meta-coordination).
 - **Parquet workloads** — `cache.parquet_optimization` warms footer blocks and `cache.meta_on_write` caches object metadata before readers need them; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 

@@ -313,6 +313,28 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 	return s.clampPopulateWeight(w)
 }
 
+// diskOverBudget reports whether tracked disk usage has reached the configured
+// shed ratio of the disk cap. When it has, eviction is behind ingest and every
+// new body would be evicted before it is read back, so populates are shed and
+// the object is served without caching. False when shedding is disabled, there
+// is no disk cap, or the engine cannot report usage.
+//
+// The signal is THIS node's store. In a cluster the body may land on a peer,
+// but a balanced ring fills every node at the same rate, so one node over
+// budget means the ring is over budget; owner-side enforcement belongs in the
+// engine.
+func (s *Service) diskOverBudget() bool {
+	if s.config == nil || s.cache == nil {
+		return false
+	}
+	threshold := s.config.Cache.PopulateShedDiskRatio
+	if threshold <= 0 {
+		return false
+	}
+	ratio, ok := s.cache.DiskUsageRatio()
+	return ok && ratio >= threshold
+}
+
 // backgroundPopulateWeight reserves the direct writer buffers before the upstream
 // response reveals its size. A block scratch buffer is reserved separately after the
 // response selects block representation. It does not clamp to a smaller memory budget:
@@ -620,6 +642,16 @@ func (s *Service) releaseEnginePutSlot(weight int64) {
 // false when either the count limit or the memory budget is saturated, in which
 // case the caller should skip caching rather than block or spawn unbounded work.
 func (s *Service) acquireCacheSlot(ctx context.Context, weight int64, prio populatePriority) bool {
+	// A store that cannot evict as fast as it fills gains nothing from another
+	// populate; shed before touching either limiter.
+	if s.diskOverBudget() {
+		source := "read_miss"
+		if prio == priorityWarmWrite {
+			source = "warm_on_write"
+		}
+		metrics.RecordCachePopulateDiskShed(source)
+		return false
+	}
 	// Warm-on-write may block waiting for its reserved budget, so it reserves the
 	// byte budget FIRST and takes the count slot only once budget is secured.
 	// Reversing this (count-then-blocking-budget) would let a waiting warm hold a

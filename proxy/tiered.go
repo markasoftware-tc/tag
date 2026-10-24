@@ -169,7 +169,19 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// forwards and never needs the prior version — a metadata failure must not
 	// block a PUT that goes upstream anyway (including the unknown-key writes
 	// that bootstrap credential learning).
-	if result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold {
+	conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+
+	// A local-tier write while the store is over its disk budget would be
+	// evicted before it is read; send it upstream instead (the upstream tier is
+	// a legitimate placement) and let eviction catch up. Conditional writes are
+	// exempt: their precondition must be evaluated against the local copy, which
+	// upstream cannot see, so they take the local path whatever the budget.
+	localTier := result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold
+	if localTier && !conditional && s.diskOverBudget() {
+		metrics.RecordCachePopulateDiskShed("tiered_put")
+		localTier = false
+	}
+	if localTier {
 		// The prior version's tier decides what an overwrite must clean up and
 		// where a conditional write is evaluated, so a failed lookup cannot be
 		// read as "no prior". Fail retryably instead.
@@ -182,7 +194,6 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		if found {
 			prior = priorMeta
 		}
-		conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
 
 		// A conditional write against an upstream-tier prior forwards: the
 		// engine can only evaluate preconditions against a local body, and
@@ -544,6 +555,12 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	if accessKey == "" || secretKey == "" || !s.cache.IsEnabled() {
 		return
 	}
+	// Over the disk budget the healed body would be evicted straight away.
+	if s.diskOverBudget() {
+		metrics.RecordCachePopulateDiskShed("retier")
+		metrics.RecordTieredRetier("shed")
+		return
+	}
 	// Backoff, not an outcome: a recent attempt for this exact marker version
 	// already found upstream changed or gone (recorded then as "changed"), so
 	// repeating the full-body fetch within the cooldown only burns bandwidth.
@@ -680,6 +697,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			if derr := s.cache.DeleteBody(dctx, bucket, key, ref); derr != nil {
 				log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier staged body delete failed; orphan ages out by TTL")
 			}
+		}
+		if errors.Is(putBodyErr, cache.ErrPopulateShed) {
+			// The owning node refused the heal: over budget, not a fault.
+			discardRef()
+			metrics.RecordCachePopulateDiskShed("retier_owner")
+			metrics.RecordTieredRetier("shed")
+			return
 		}
 		if putBodyErr != nil {
 			// Transport failure mid-body or a cache write fault: transient,

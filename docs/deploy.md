@@ -69,10 +69,14 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.19.0
+    newTag: v1.22.3
 ```
 
 ## Production Considerations
+
+### Operating mode
+
+The manifests run the default **transparent** mode against Tigris. Set `TAG_MODE` to `signing` to front a non-Tigris S3-compatible endpoint, or to `tiered` to run TAG as a two-tier cache over a capacity-priced upstream bucket — see [Tiered store mode](tiered-mode.md) for its semantics, credential requirements, and the block-caching interaction. The [Configuration Reference](configuration.md) covers all three.
 
 ### Graceful shutdown
 
@@ -221,6 +225,43 @@ What to watch:
 - **Physical vs logical divergence is the real health signal**: compare `kubelet_volume_stats_used_bytes` for the cache PVC against `ocache_disk_usage_bytes` (live bytes). A gap that grows and never shrinks means dead space is accumulating faster than it is reclaimed; a gap that stays small means reclaim is keeping up. Expect the gap to spike during heavy population and while a recompaction holds both the old and new segment on disk.
 
 Because segments must pass the age gate first, reclaim begins roughly two hours after a pod restart, not immediately.
+
+### Upgrades and meta coordination
+
+Cache invalidation and populate ordering are coordinated by one of two mechanisms, selected at startup by `TAG_CACHE_LEGACY_COORDINATION` (`cache.legacy_coordination`):
+
+| Value | Mechanism | Cluster requirement |
+| --- | --- | --- |
+| `true` (default) | Legacy timestamp tombstones | None — safe with any mix of versions, including nodes upgrading straight from ≤v1.20 |
+| `false` | Fenced CAS (version-token preconditions) | Every node must run ≥v1.21 **before** the flip |
+
+**Upgrading from ≤v1.20:** roll out the new image with the default. No configuration change is needed and mixed-version clusters stay correct throughout the rollout.
+
+**Switching to CAS coordination** (optional, stronger ordering guarantees):
+
+1. Confirm every pod runs ≥v1.21 — `kubectl get pods -n tag -o jsonpath='{..image}'`.
+2. Set the flag in the StatefulSet and apply; the rolling restart performs the flip:
+
+   ```yaml
+   env:
+     - name: TAG_CACHE_LEGACY_COORDINATION
+       value: "false"
+   ```
+
+3. Let the rollout complete promptly. During the restart, nodes on different mechanisms do not see each other's ordering (a CAS delete writes no tombstone for a legacy populate to check, and vice versa). The exposure is bounded and converges by TTL, but it lasts as long as the rollout — do not pause it midway.
+
+Parsing is fail-safe: only an explicit `false` or `0` selects CAS; any other value keeps legacy. A standalone (single-node) deployment may flip at any time. **Tiered mode** always runs CAS: it selects CAS when the setting is unset and refuses to start with an explicit `true` (see [Tiered store mode](tiered-mode.md)). Reverting (`true`) carries the same mixed-window exposure, so do it with the same brisk rolling restart.
+
+#### Upgrading to v1.22.3
+
+v1.22.3 tightens request checks and cache integrity; nothing needs reconfiguring, but these behaviours are visible to operators and clients:
+
+- **Cached-read grants (transparent mode)** come only from a successful `GetObject` or `HeadObject`. A principal that only writes no longer unlocks cached reads for the bucket, and in tiered mode its small PUTs forward upstream instead of landing in the local tier. See [Security](security.md).
+- **Signed streaming uploads (signing mode)** using `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` have each chunk signature checked as TAG forwards the body, with frames bounded by the declared decoded length. Signature failures return `403 SignatureDoesNotMatch`; a rejected stream may reach upstream as an incomplete body but cannot complete or become a cached object. Other streaming formats (the `-TRAILER` and SigV4A variants) are decoded without chunk-signature checks.
+- **Presigned GETs (transparent forwarding)** without `X-Amz-Content-Sha256` are validated locally and can be served from cache. `X-Amz-Expires` must be present, between 1 and 604800 seconds, and not expired; signing dates more than 15 minutes in the future are rejected. In tiered mode a locally validated plain presigned GET for an object TAG has no metadata for answers `NoSuchKey`, matching header-signed requests. Signing forwarding — including tiered deployments on non-Tigris endpoints — still requires `X-Amz-Content-Sha256`.
+- **Representation selectors** (`versionId`, `partNumber`, `response-*` overrides) bypass the cache and forward upstream with `X-Cache: BYPASS` in proxy modes. In tiered mode, locally validated requests with these selectors forward only for upstream-tier objects; for local-tier objects or missing metadata they return `501 NotImplemented`.
+- **Cache integrity:** truncated or over-long cached bodies are refused and invalidated on detection; every cache read runs under a deadline (size-scaled for buffered reads, five minutes for client-paced streams); bulk `DeleteObjects` waits for best-effort cache invalidation attempts under a shared 10-second deadline. After that deadline, remaining keys are skipped and TAG still returns the upstream result; stale entries may remain until TTL. In tiered mode, a key already in progress can extend the wait by its own 10-second timeout.
+- **Shutdown** waits past the drain deadline for in-flight handlers and detached cache work before closing storage (see [Graceful shutdown](#graceful-shutdown)). With the base `terminationGracePeriodSeconds: 30`, a pod still busy at the deadline is SIGKILLed where older versions closed storage early; raise the grace period if clean exits matter.
 
 ### Health Checks
 
