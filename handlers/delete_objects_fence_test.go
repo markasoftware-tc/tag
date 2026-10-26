@@ -630,7 +630,9 @@ func TestBulkDeleteClientCancellationDoesNotCancelPostSuccessFence(t *testing.T)
 	service := proxy.NewService(forwarder, cacheStore, cfg)
 	router := NewServer(service, "127.0.0.1", 0, false, cfg.Server.MaxInflightRequests).Router()
 	handlerDone := make(chan struct{})
+	gatewayRequestContext := make(chan context.Context, 1)
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gatewayRequestContext <- r.Context()
 		defer close(handlerDone)
 		router.ServeHTTP(w, r)
 	}))
@@ -659,6 +661,12 @@ func TestBulkDeleteClientCancellationDoesNotCancelPostSuccessFence(t *testing.T)
 	if err := waitBulkDeleteFenceSignal(ctx, owner.postFence, "post-success cache fence"); err != nil {
 		t.Fatal(err)
 	}
+	var gatewayCtx context.Context
+	select {
+	case gatewayCtx = <-gatewayRequestContext:
+	case <-ctx.Done():
+		t.Fatalf("gateway did not receive DeleteObjects request: %v", ctx.Err())
+	}
 	var fenceCtx context.Context
 	select {
 	case fenceCtx = <-fenceContext:
@@ -678,6 +686,14 @@ func TestBulkDeleteClientCancellationDoesNotCancelPostSuccessFence(t *testing.T)
 	}
 	if !errors.Is(clientErr, context.Canceled) {
 		t.Errorf("canceled DeleteObjects client error = %v, want context.Canceled", clientErr)
+	}
+	select {
+	case <-gatewayCtx.Done():
+	case <-ctx.Done():
+		t.Fatalf("gateway request did not observe client cancellation: %v", ctx.Err())
+	}
+	if err := gatewayCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Errorf("gateway request context error = %v, want context.Canceled", err)
 	}
 	if err := fenceCtx.Err(); err != nil {
 		t.Errorf("client cancellation reached the detached post-success fence context: %v", err)
