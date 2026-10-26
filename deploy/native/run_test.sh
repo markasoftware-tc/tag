@@ -35,9 +35,22 @@ done
 if [ -n "${output}" ]; then
     cat >"${output}" <<'BINARY'
 #!/bin/sh
-printf '%s\n%s\n' "${TAG_MAX_IDLE_CONNS_PER_HOST-<unset>}" "$*" >"${TAG_RUN_CAPTURE}"
+capture_tmp="${TAG_RUN_CAPTURE}.tmp"
+printf '%s\n%s\n' "${TAG_MAX_IDLE_CONNS_PER_HOST-<unset>}" "$*" >"${capture_tmp}"
+mv "${capture_tmp}" "${TAG_RUN_CAPTURE}"
 BINARY
     chmod +x "${output}"
+else
+    capture="${TAG_RUN_CAPTURE:?TAG_RUN_CAPTURE is required for the mock health check}"
+    attempts=0
+    while [ ! -f "${capture}" ]; do
+        if [ "${attempts}" -ge 100 ]; then
+            echo "mock health check timed out waiting for launch capture" >&2
+            exit 28
+        fi
+        attempts=$((attempts + 1))
+        command -p sleep 0.01
+    done
 fi
 exit 0
 MOCK
