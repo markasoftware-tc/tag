@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.22.3
+    newTag: v1.23.0
 ```
 
 ## Production Considerations
@@ -80,11 +80,13 @@ The manifests run the default **transparent** mode against Tigris. Set `TAG_MODE
 
 ### Graceful shutdown
 
-On SIGINT or SIGTERM, TAG stops admitting HTTP requests and drains admitted handlers for up to 30 seconds. A request that finishes inside the drain window retains its normal response. When the drain deadline passes with handlers still running, TAG cancels their request contexts and closes their HTTP connections, logs a warning with the in-flight count, and then keeps waiting for those handlers and their cache-consistency cleanup to return; a longer request may be aborted, but its handler is still joined before shutdown proceeds.
+On SIGINT or SIGTERM, TAG stops admitting HTTP requests and drains admitted handlers for up to 20 seconds. A request that finishes inside the drain window retains its normal response. When the drain deadline passes with handlers still running, TAG cancels their request contexts and closes their HTTP connections, logs a warning with the in-flight count, and then keeps waiting for those handlers and their cache-consistency cleanup to return; a longer request may be aborted, but its handler is still joined before shutdown proceeds.
 
 After the handlers return, TAG cancels the Service lifetime and joins admitted detached cache work before closing embedded storage. This join has no deadline: a cache call that does not return after cancellation can extend process shutdown, and TAG logs a warning with the outstanding task count if the join passes 30 seconds. An admitted tiered cleanup continues under its own timeout so it may finish its conditional S3 delete and metadata repair; the join still waits for it.
 
 The base StatefulSet sets `terminationGracePeriodSeconds: 30`, which is a separate process-termination limit. When that grace expires, Kubernetes sends SIGKILL even if TAG is still waiting for handler cleanup or detached cache work. Set the pod's termination grace to the longest cleanup interval you need to allow; no finite grace can guarantee completion for uncooperative storage.
+
+The 20-second drain leaves 10 seconds of that grace for the cache to leave the cluster: the ring `LEAVING` announcement, the memberlist leave (5-second timeout) and closing storage. A pod killed before the leave leaves a stale alive entry in its peers' gossip view; they keep routing that node's keys to a dead address until failure detection declares it dead (seconds with the embedded engine's bounded dial timeout, minutes without), and a restart that comes back on a new address is refused as an address conflict until then. If you raise the drain window, raise the termination grace by the same amount.
 
 ### High Availability
 
@@ -263,6 +265,16 @@ v1.22.3 tightens request checks and cache integrity; nothing needs reconfiguring
 - **Cache integrity:** truncated or over-long cached bodies are refused and invalidated on detection; every cache read runs under a deadline (size-scaled for buffered reads, five minutes for client-paced streams); bulk `DeleteObjects` waits for best-effort cache invalidation attempts under a shared 10-second deadline. After that deadline, remaining keys are skipped and TAG still returns the upstream result; stale entries may remain until TTL. In tiered mode, a key already in progress can extend the wait by its own 10-second timeout.
 - **Shutdown** waits past the drain deadline for in-flight handlers and detached cache work before closing storage (see [Graceful shutdown](#graceful-shutdown)). With the base `terminationGracePeriodSeconds: 30`, a pod still busy at the deadline is SIGKILLed where older versions closed storage early; raise the grace period if clean exits matter.
 
+#### Upgrading to v1.23.0
+
+v1.23.0 adds **disk-budget populate shedding** (embedded engine ocache v1.14.0). It is on by default wherever a disk cap is set, and needs no configuration change:
+
+- **What it does.** While a node's tracked usage is at or above `cache.populate_shed_disk_ratio` (default `1.05`) of `max_disk_usage_bytes`, new cache bodies are not written: eviction has fallen behind ingest, and a body written now would be evicted before it is read. Objects are still served; only the write is skipped. Metadata, markers and tombstones are never shed.
+- **Two layers.** The node serving the request pre-checks its own store, and the engine enforces the same ratio at the node that owns the body, so a node under budget cannot fill an overloaded peer. In a cluster, nodes can differ by several percent of the cap.
+- **Tiered mode.** When the serving node is over budget, a small PUT that would land in the local tier goes upstream with a marker instead. Conditional writes are exempt from that check (their precondition is evaluated against the local copy); a conditional write against an upstream-tier marker still forwards upstream as before. If only the owning node is over budget and refuses after the body has been consumed, the PUT answers `503 SlowDown`; clients retry as for any throttle. Re-tier-on-read is skipped while over budget.
+- **Observing it.** `tag_cache_populate_disk_shed_total{source}` counts sheds by path (`tiered_put`, `retier`, `read_miss`, `warm_on_write` for the local pre-check; `*_owner` for refusals by the owning node); `ocache_rpc_requests_total{status="shed"}` counts them on the engine side. A node that sheds continuously is undersized for its write rate; raise `max_disk_usage_bytes` or add nodes.
+- **Tuning.** `TAG_CACHE_POPULATE_SHED_DISK_RATIO` sets the ratio (`0` keeps the default, a negative value disables shedding; non-finite values are ignored). Without a disk cap nothing is ever shed.
+
 ### Health Checks
 
 TAG exposes a health endpoint:
@@ -281,6 +293,8 @@ Key metrics:
 - `tag_requests_total{status="error"}` - error rate
 - `tag_cache_hits_total / (tag_cache_hits_total + tag_cache_misses_total)` - cache hit ratio
 - `tag_upstream_request_duration_seconds` - upstream latency
+- `tag_cache_populate_disk_shed_total` - cache writes skipped because the store is over its disk budget (should be zero on a correctly sized node)
+- `ocache_disk_usage_ratio` - tracked usage against `max_disk_usage_bytes`; shedding starts at `populate_shed_disk_ratio` (default 1.05)
 
 ## Troubleshooting
 

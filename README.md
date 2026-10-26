@@ -44,7 +44,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.22.3/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.23.0/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -68,7 +68,7 @@ Deploy as a StatefulSet with an embedded distributed cache using the Kustomize m
 kubectl apply -k deploy/kubernetes/base/
 ```
 
-See [docs/deploy.md](docs/deploy.md) for the full guide. On SIGTERM, TAG gives HTTP requests a 30-second drain window and keeps the embedded cache open until admitted handlers finish their synchronous cleanup.
+See [docs/deploy.md](docs/deploy.md) for the full guide. On SIGTERM, TAG gives HTTP requests a 20-second drain window, keeps the embedded cache open until admitted handlers finish their synchronous cleanup, and uses the rest of the 30-second termination grace to leave the cache cluster cleanly.
 Kubernetes may enforce a separate termination grace period (see [graceful shutdown](docs/deploy.md#graceful-shutdown)).
 
 ### Build from source
