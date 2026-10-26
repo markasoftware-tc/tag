@@ -201,9 +201,6 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 						defer s.releaseRetierWrite(bucket, obj.Key)
 						_, v, known := s.captureMarkerPrior(requestCtx, bucket, obj.Key)
 						tieredPriors[obj.Key] = tieredPrior{version: v, known: known}
-						if err := requestCtx.Err(); err != nil {
-							return recordRequestResult(err)
-						}
 					}
 				}
 				requestedCounts[obj.Key]++
