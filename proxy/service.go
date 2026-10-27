@@ -210,6 +210,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	log.Info().
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int("max_concurrent_block_fetches", cfg.Cache.MaxConcurrentBlockFetches).
+		Int("max_range_block_fanout", cfg.Cache.MaxRangeBlockFanout).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
 		Int64("background_populate_writer_buffer_cap_bytes", backgroundPopulateWriterCap).

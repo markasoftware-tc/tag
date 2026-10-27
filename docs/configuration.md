@@ -22,6 +22,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
 | `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `1048576` (1 MiB)        |
 | `TAG_CACHE_MAX_CONCURRENT_BLOCK_FETCHES` | Max missing blocks one request fetches from upstream concurrently. Raising it cuts the upstream round trips a cold multi-block range read waits on before responding; process-wide populate limits still apply (`0`/negative ignored) | `4` |
+| `TAG_CACHE_MAX_RANGE_BLOCK_FANOUT` | Max missing blocks one range read fetches as individual block GETs; a range with more is served by a single upstream range GET and populates no blocks. Also caps the warm-serve prefetch window (`0`/negative ignored) | `32` |
 | `TAG_CACHE_SIZE_THRESHOLD`         | Max object size to cache (bytes); larger bodies pass through uncached                                                                                                                          | `1073741824` (1 GiB)     |
 | `TAG_CACHE_META_ON_WRITE`          | Cache an object's metadata (not its body) when TAG proxies its write, so the first read resolves it from cache instead of a round trip. Closes the multipart gap, where write-through cannot tee a body TAG never sees (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
 | `TAG_CACHE_PARQUET_OPTIMIZATION`   | Cache a parquet object's metadata blocks ahead of the reader that needs them, so opening the file does not discover them as serial misses. Two triggers: a read reaching the object's tail (helps second and later opens) and a write through TAG (helps the first). Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
@@ -214,6 +215,14 @@ cache:
   # and max_populate_memory_bytes still bound the process as a whole. 0/unset/negative = default
   # (4). Override with TAG_CACHE_MAX_CONCURRENT_BLOCK_FETCHES env var.
   max_concurrent_block_fetches: 4
+
+  # Max missing blocks ONE range read (serve or background populate) fetches as individual
+  # aligned block GETs. A range with more missing blocks is served from a single upstream range
+  # GET and populates no blocks, which bounds per-request upstream fan-out. Raise it when
+  # clients issue large ranges that should still be block-cached. Also caps the warm-serve
+  # prefetch window, so a warm range never stages more block buffers than a cold one may fetch.
+  # 0/unset/negative = default (32). Override with TAG_CACHE_MAX_RANGE_BLOCK_FANOUT env var.
+  max_range_block_fanout: 32
 
   # Cache object METADATA on write (opt-in, prototype). TAG invalidates on write and
   # caches nothing, so the first read of a freshly written object pays an upstream
@@ -435,6 +444,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades; unreadable or malformed markers refuse ordered metadata writes); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `max_concurrent_block_fetches` | int | `4`             | Max missing blocks one request fetches from upstream concurrently (`0`/unset/negative = default) |
+| `max_range_block_fanout` | int    | `32`             | Max missing blocks one range read fetches as block GETs before falling back to one upstream range GET; also caps the warm-serve prefetch window (`0`/unset/negative = default) |
 | `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |

@@ -560,6 +560,40 @@ func TestLoad_MaxConcurrentBlockFetchesDefaultAndOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_MaxRangeBlockFanoutDefaultAndOverride(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want int
+	}{
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheMaxRangeBlockFanout},
+		{"yaml honored", "cache:\n  enabled: true\n  max_range_block_fanout: 64\n", "", 64},
+		{"env override honored", "cache:\n  enabled: true\n  max_range_block_fanout: 64\n", "128", 128},
+		{"non-positive env ignored", "cache:\n  enabled: true\n  max_range_block_fanout: 64\n", "0", 64},
+		// Non-positive would read as "unbounded" fan-out, so it takes the default.
+		{"negative yaml defaults", "cache:\n  enabled: true\n  max_range_block_fanout: -1\n", "", DefaultCacheMaxRangeBlockFanout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_MAX_RANGE_BLOCK_FANOUT", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.MaxRangeBlockFanout != tc.want {
+				t.Errorf("MaxRangeBlockFanout = %d, want %d", cfg.Cache.MaxRangeBlockFanout, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_SizeThresholdOverrideByEnv(t *testing.T) {
 	cases := []struct {
 		name string

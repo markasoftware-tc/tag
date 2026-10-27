@@ -496,9 +496,9 @@ func waitForBlockReadStarts(t *testing.T, started <-chan struct{}, want int) {
 // overlap deterministic; streamBlockRange still reports only fully ordered
 // cache hits after all bytes reach the writer.
 func TestBlockCache_PipelinePrefetchesRemoteReads(t *testing.T) {
-	const blocks = maxBlockServePrefetch + 1
+	const blocks = config.DefaultCacheMaxRangeBlockFanout + 1
 	fixture := newBlockPrefetchFixture(t, true, blocks)
-	started := make(chan struct{}, maxBlockServePrefetch)
+	started := make(chan struct{}, config.DefaultCacheMaxRangeBlockFanout)
 	gate := make(chan struct{})
 	fixture.trace.reset()
 	fixture.controller.configure(gate, started)
@@ -515,9 +515,9 @@ func TestBlockCache_PipelinePrefetchesRemoteReads(t *testing.T) {
 		results <- result{out: out, err: err, w: w}
 	}()
 
-	waitForBlockReadStarts(t, started, maxBlockServePrefetch)
-	if got := fixture.trace.peak(); got != maxBlockServePrefetch {
-		t.Fatalf("concurrent remote cache reads = %d, want %d", got, maxBlockServePrefetch)
+	waitForBlockReadStarts(t, started, config.DefaultCacheMaxRangeBlockFanout)
+	if got := fixture.trace.peak(); got != config.DefaultCacheMaxRangeBlockFanout {
+		t.Fatalf("concurrent remote cache reads = %d, want %d", got, config.DefaultCacheMaxRangeBlockFanout)
 	}
 	close(gate)
 
@@ -536,7 +536,7 @@ func TestBlockCache_PipelinePrefetchesRemoteReads(t *testing.T) {
 // for three blocks, the 32-block request must stop at three concurrent reads
 // and return every reservation after the ordered write loop completes.
 func TestBlockCache_PipelinePrefetchWindowRespectsStagingBudget(t *testing.T) {
-	const blocks = maxBlockServePrefetch
+	const blocks = config.DefaultCacheMaxRangeBlockFanout
 	fixture := newBlockPrefetchFixture(t, false, blocks)
 	blockSize := int64(prefetchTestBlockSize)
 	total := 6 * blockSize // NewService's half staging cap is three block buffers.
@@ -834,7 +834,7 @@ func (c *cancellablePrefetchClient) GetRangeStream(ctx context.Context, key stri
 func TestBlockCache_PipelineClientWriteFailureCancelsPrefetches(t *testing.T) {
 	const (
 		blockSize  = 2
-		blockCount = maxBlockServePrefetch
+		blockCount = config.DefaultCacheMaxRangeBlockFanout
 		total      = 128 // staging cap is 64 bytes: exactly 32 block buffers.
 	)
 	firstStarted := make(chan struct{}, 1)

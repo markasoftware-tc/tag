@@ -30,12 +30,19 @@ func (s *Service) maxConcurrentBlockFetches() int {
 }
 
 // maxRangeBlockFanout caps how many absent blocks a single range read (serve or background
-// populate) will fetch as individual aligned GETs. A footer or row-group read touches only a few
-// blocks and assembles inline; a pathologically large client range (e.g. most of a multi-hundred-MB
-// object in one Range header) exceeds this and is instead served from a single upstream range GET
-// with no block population, bounding the per-request upstream fan-out. At the 4 MiB default block
-// size this is ~128 MiB of range before the cap engages.
-const maxRangeBlockFanout = 32
+// populate) will fetch as individual aligned GETs (cache.max_range_block_fanout). A footer or
+// row-group read touches only a few blocks and assembles inline; a pathologically large client
+// range (e.g. most of a multi-hundred-MB object in one Range header) exceeds this and is instead
+// served from a single upstream range GET with no block population, bounding the per-request
+// upstream fan-out. At the default 32 and 1 MiB block size this is ~32 MiB of range before the
+// cap engages. A non-positive value — from a config that skipped applyDefaults — would read as
+// "unbounded" to ensureBlocksCached, so it falls back to the default.
+func (s *Service) maxRangeBlockFanout() int64 {
+	if n := s.config.Cache.MaxRangeBlockFanout; n > 0 {
+		return int64(n)
+	}
+	return config.DefaultCacheMaxRangeBlockFanout
+}
 
 // certifiedRangeReadTimeout bounds only the speculative pre-commit reads for a certified span.
 // It is derived from the caller context (so a shorter request deadline wins) and matches the
@@ -98,7 +105,9 @@ const maxInlineFetchesPerServe = 2
 // response. Matching the range miss fan-out cap prevents a complete warm range from staging more
 // buffers than a cold range may fetch, while the staging reservation imposes the tighter limit
 // when memory is scarce.
-const maxBlockServePrefetch = maxRangeBlockFanout
+func (s *Service) maxBlockServePrefetch() int64 {
+	return s.maxRangeBlockFanout()
+}
 
 // errBlockStreamDegraded marks a committed block serve that hit a block the cache can no longer
 // produce and an inline fetch could not (or should not) recover — but whose remaining bytes
@@ -129,9 +138,9 @@ func (s *Service) isBlockEligibleSize(contentLength int64) bool {
 // blockSpanForRange turns the range that created a block-mode entry into a bounded,
 // write-once hint. The caller invokes this only after fetchBlocksToCache has returned
 // successfully, so publishing the span cannot claim blocks that were not durable.
-func blockSpanForRange(meta *cache.CachedObjectMeta, touched []int64) *cache.BlockSpan {
+func (s *Service) blockSpanForRange(meta *cache.CachedObjectMeta, touched []int64) *cache.BlockSpan {
 	if meta == nil || meta.BlockSize <= 0 || meta.ContentLength <= 0 || len(touched) == 0 ||
-		len(touched) > maxRangeBlockFanout {
+		int64(len(touched)) > s.maxRangeBlockFanout() {
 		return nil
 	}
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
@@ -151,8 +160,9 @@ func blockSpanForRange(meta *cache.CachedObjectMeta, touched []int64) *cache.Blo
 
 // certifiedRangeBlockSpanCovers accepts a span only when it is still meaningful
 // for this metadata row's ETag and block layout. The certificate is advisory: a
-// later eviction is detected by the payload read and returned to the old pre-commit gate.
-func certifiedRangeBlockSpanCovers(meta *cache.CachedObjectMeta, b0, bK int64) bool {
+// later eviction is detected by the payload read and returned to the old pre-commit gate. A span
+// recorded under a larger fan-out cap than the current one is not trusted.
+func (s *Service) certifiedRangeBlockSpanCovers(meta *cache.CachedObjectMeta, b0, bK int64) bool {
 	if meta == nil || meta.ETag == "" || meta.BlockSize <= 0 || meta.ContentLength <= 0 ||
 		meta.RangeBlockSpan == nil || b0 < 0 || bK < b0 {
 		return false
@@ -160,7 +170,7 @@ func certifiedRangeBlockSpanCovers(meta *cache.CachedObjectMeta, b0, bK int64) b
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 	span := meta.RangeBlockSpan
 	if span.First < 0 || span.Last < span.First || span.Last > lastBlock ||
-		span.Last-span.First+1 > maxRangeBlockFanout {
+		span.Last-span.First+1 > s.maxRangeBlockFanout() {
 		return false
 	}
 	return span.First <= b0 && bK <= span.Last
@@ -275,7 +285,7 @@ func (s *Service) serveRangeFromBlockCache(
 	// owner of missing-block recovery and pre-commit stale-version handling. The hint stays advisory
 	// because blocks can evict independently. A short range that crosses a block boundary keeps its
 	// existing assembled path, and a staging-budget decline keeps probe-first behavior.
-	if rangeLen > meta.BlockSize && bK > b0 && certifiedRangeBlockSpanCovers(meta, b0, bK) {
+	if rangeLen > meta.BlockSize && bK > b0 && s.certifiedRangeBlockSpanCovers(meta, b0, bK) {
 		weight := s.stagingWeight(rangeLen)
 		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
 			served, retryProbe, rangeErr := s.serveCertifiedRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime, weight)
@@ -312,7 +322,7 @@ func (s *Service) serveRangeFromBlockCache(
 	// per-request fan-out (maxRangeBlockFanout): a normal footer/row-group read assembles its few
 	// blocks inline, but a pathologically large client range whose covering blocks are mostly
 	// absent bails to a single upstream range GET instead of a fetch storm.
-	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK, false, maxRangeBlockFanout); ferr != nil {
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK, false, s.maxRangeBlockFanout()); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			// Too many absent blocks to assemble; serve this range from a single upstream GET. The
 			// entry is still valid (other blocks may be cached) — do NOT invalidate it here.
@@ -737,7 +747,7 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 //
 // Multi-block serves use a bounded ordered prefetch window. Each cache read lands in its own
 // pooled buffer, so independently routed remote block keys can be in flight together while the
-// write loop still commits their bytes in order. The window admits at most maxRangeBlockFanout
+// write loop still commits their bytes in order. The window admits at most maxBlockServePrefetch
 // buffers and is reserved against the serve-staging byte budget (never the populate budget — see
 // NewService). Under budget pressure it selects the largest window of at least two buffers that
 // fits; when even two buffers do not fit — and for single-block serves, where there is nothing to
@@ -753,7 +763,7 @@ func (s *Service) streamBlockRangeWithFooterRange(ctx context.Context, w http.Re
 	if b0 == bK {
 		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 	} else {
-		requested := min(bK-b0+1, int64(maxBlockServePrefetch))
+		requested := min(bK-b0+1, s.maxBlockServePrefetch())
 		pipelined := false
 		for window := requested; window >= 2; window-- {
 			weight := s.stagingWeight(window * meta.BlockSize)
@@ -1948,7 +1958,7 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 	// number of blocks (a very large client range) would fetch them all as individual aligned GETs,
 	// a per-block upstream storm. Skip populating this range — it was already served from upstream,
 	// and the object still gets block-cached by later footer/row-group reads that touch few blocks.
-	if int64(len(touched)) > maxRangeBlockFanout {
+	if int64(len(touched)) > s.maxRangeBlockFanout() {
 		log.Debug().Str("bucket", bucket).Str("key", key).Int("touched", len(touched)).Msg("Block-mode populate skipped - range touches too many blocks (would amplify)")
 		return
 	}
@@ -1983,7 +1993,7 @@ func (s *Service) populateBlockMode(ctx context.Context, bucket, key, accessKey,
 	// Keep it on this fresh metadata copy: later range reads never extend the original
 	// span, and the version-preconditioned meta write remains the sole publication point.
 	publishedMeta := *meta
-	publishedMeta.RangeBlockSpan = blockSpanForRange(meta, touched)
+	publishedMeta.RangeBlockSpan = s.blockSpanForRange(meta, touched)
 	s.finalizeBlockModeMeta(ctx, bucket, key, &publishedMeta, len(touched), expected)
 }
 

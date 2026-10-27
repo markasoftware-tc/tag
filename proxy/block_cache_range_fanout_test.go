@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -109,19 +110,24 @@ func TestBlockCache_RangeFanoutStopsAfterCapPlusOneMisses(t *testing.T) {
 		name               string
 		blocks             int
 		cached             []int
+		fanout             int // 0 keeps the configured default
 		wantProbes         int
 		wantRemoteLocality float64
 	}{
 		{name: "33 all missing", blocks: 33, wantProbes: 33},
-		{name: "50 early crossing with cached tail", blocks: 50, cached: []int{0, 40}, wantProbes: int(maxRangeBlockFanout) + 2, wantRemoteLocality: 1},
+		{name: "configured cap of 8 with 20 all missing", blocks: 20, fanout: 8, wantProbes: 9},
+		{name: "50 early crossing with cached tail", blocks: 50, cached: []int{0, 40}, wantProbes: config.DefaultCacheMaxRangeBlockFanout + 2, wantRemoteLocality: 1},
 		{name: "50 late crossing", blocks: 50, cached: rangeFanoutPrefix(17), wantProbes: 50, wantRemoteLocality: 17},
-		{name: "128 early crossing with cached tail", blocks: 128, cached: []int{0, 80}, wantProbes: int(maxRangeBlockFanout) + 2, wantRemoteLocality: 1},
+		{name: "128 early crossing with cached tail", blocks: 128, cached: []int{0, 80}, wantProbes: config.DefaultCacheMaxRangeBlockFanout + 2, wantRemoteLocality: 1},
 		{name: "128 late crossing", blocks: 128, cached: rangeFanoutPrefix(95), wantProbes: 128, wantRemoteLocality: 95},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newRangeFanoutFixture(t, 4, tc.blocks, tc.cached, 0)
+			if tc.fanout != 0 {
+				fixture.service.config.Cache.MaxRangeBlockFanout = tc.fanout
+			}
 			if err := fixture.warmRemoteConnections(); err != nil {
 				t.Fatalf("warm remote owner: %v", err)
 			}
@@ -181,7 +187,7 @@ func TestBlockCache_RangeFanoutTransientProbeErrorIsNotAMiss(t *testing.T) {
 	fixture.startProbeTracking()
 	fixture.owner.failKey = cache.MakeBlockKey(fixture.bucket, fixture.key, fixture.etag, fixture.blockSize, 32)
 
-	err := fixture.service.ensureBlocksCached(context.Background(), fixture.bucket, fixture.key, "access", "secret", fixture.meta, 0, 49, false, maxRangeBlockFanout)
+	err := fixture.service.ensureBlocksCached(context.Background(), fixture.bucket, fixture.key, "access", "secret", fixture.meta, 0, 49, false, fixture.service.maxRangeBlockFanout())
 	if status.Code(err) != codes.Unavailable || errors.Is(err, errBlockAssemblyWouldAmplify) {
 		t.Fatalf("ensureBlocksCached error = %v, want the transient owner error (not amplification)", err)
 	}
@@ -203,7 +209,7 @@ func TestBlockCache_RangeFanoutCancellationAfterCutoffIsPreserved(t *testing.T) 
 	fixture.client.afterProbe = func(_ string, err error) {
 		if err != nil {
 			missingProbes++
-			if missingProbes == int(maxRangeBlockFanout)+1 {
+			if missingProbes == config.DefaultCacheMaxRangeBlockFanout+1 {
 				cancel()
 			}
 		}
@@ -214,7 +220,7 @@ func TestBlockCache_RangeFanoutCancellationAfterCutoffIsPreserved(t *testing.T) 
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("HandleGetObject error = %v, want context.Canceled", err)
 	}
-	assertRecordedRangeProbes(t, fixture, expectedRangeProbeKeys(fixture, int(maxRangeBlockFanout)+2))
+	assertRecordedRangeProbes(t, fixture, expectedRangeProbeKeys(fixture, config.DefaultCacheMaxRangeBlockFanout+2))
 	if w.Body.Len() != 0 {
 		t.Fatalf("canceled fallback wrote %d response bytes, want none", w.Body.Len())
 	}
@@ -252,7 +258,7 @@ func TestBlockCache_RangeFanoutProbeFailureAtTheLimitDoesNotBail(t *testing.T) {
 		t.Fatalf("warm remote owner: %v", err)
 	}
 	fixture.startProbeTracking()
-	fixture.owner.failKey = cache.MakeBlockKey(fixture.bucket, fixture.key, fixture.etag, fixture.blockSize, int64(maxRangeBlockFanout))
+	fixture.owner.failKey = cache.MakeBlockKey(fixture.bucket, fixture.key, fixture.etag, fixture.blockSize, int64(config.DefaultCacheMaxRangeBlockFanout))
 
 	w := httptest.NewRecorder()
 	if err := fixture.service.HandleGetObject(w, blockGet(fixture.bucket, fixture.key, "bytes=0-199")); err != nil {
@@ -261,7 +267,7 @@ func TestBlockCache_RangeFanoutProbeFailureAtTheLimitDoesNotBail(t *testing.T) {
 	if w.Code != http.StatusPartialContent || !bytes.Equal(w.Body.Bytes(), fixture.body) {
 		t.Fatalf("fallback response = %d/%d bytes, want 206 with %d exact bytes", w.Code, w.Body.Len(), len(fixture.body))
 	}
-	assertRecordedRangeProbes(t, fixture, expectedRangeProbeKeys(fixture, int(maxRangeBlockFanout)+1))
+	assertRecordedRangeProbes(t, fixture, expectedRangeProbeKeys(fixture, config.DefaultCacheMaxRangeBlockFanout+1))
 	if got := fixture.forwarder.upstreamCalls.Load(); got != 1 {
 		t.Fatalf("upstream requests = %d, want one range fallback", got)
 	}

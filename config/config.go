@@ -53,6 +53,10 @@ const (
 	// fetched from upstream concurrently.
 	DefaultCacheMaxConcurrentBlockFetches = 4
 
+	// DefaultCacheMaxRangeBlockFanout is the default cap on missing blocks one range read
+	// fetches as individual block GETs before falling back to a single upstream range GET.
+	DefaultCacheMaxRangeBlockFanout = 32
+
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
 
@@ -373,6 +377,14 @@ type CacheConfig struct {
 	// negative value, or unset uses DefaultCacheMaxConcurrentBlockFetches. Only meaningful
 	// when BlockCachingEnabled is true.
 	MaxConcurrentBlockFetches int `yaml:"max_concurrent_block_fetches"`
+	// MaxRangeBlockFanout caps how many missing blocks ONE range read (serve or background
+	// populate) fetches as individual aligned block GETs. A range with more missing blocks is
+	// served from a single upstream range GET and populates no blocks, bounding per-request
+	// upstream fan-out. The same value caps the warm-serve prefetch window, so a warm range
+	// never stages more block buffers than a cold one may fetch. 0, a negative value, or
+	// unset uses DefaultCacheMaxRangeBlockFanout. Only meaningful when BlockCachingEnabled is
+	// true.
+	MaxRangeBlockFanout int `yaml:"max_range_block_fanout"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
 	// that warm-on-write populates may reserve ahead of read-miss warms, so
 	// warm-on-write is never starved by the read-miss full-object warm flood. The
@@ -546,6 +558,11 @@ func applyDefaults(cfg *Config) {
 	// so any non-positive value falls back to the default.
 	if cfg.Cache.MaxConcurrentBlockFetches <= 0 {
 		cfg.Cache.MaxConcurrentBlockFetches = DefaultCacheMaxConcurrentBlockFetches
+	}
+	// Non-positive would mean "unbounded" to ensureBlocksCached, which is not a safe per-request
+	// fan-out, so it falls back to the default.
+	if cfg.Cache.MaxRangeBlockFanout <= 0 {
+		cfg.Cache.MaxRangeBlockFanout = DefaultCacheMaxRangeBlockFanout
 	}
 	if cfg.Cache.DiskPath == "" {
 		cfg.Cache.DiskPath = DefaultCacheDiskPath
@@ -793,6 +810,10 @@ func applyEnvOverrides(cfg *Config) {
 		// Override the per-request block-fetch concurrency from environment (0/unset keeps the default).
 		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_BLOCK_FETCHES"); ok && n > 0 {
 			cfg.Cache.MaxConcurrentBlockFetches = n
+		}
+		// Override the per-range missing-block fan-out cap from environment (0/unset keeps the default).
+		if n, ok := envInt("TAG_CACHE_MAX_RANGE_BLOCK_FANOUT"); ok && n > 0 {
+			cfg.Cache.MaxRangeBlockFanout = n
 		}
 		// Override the max cacheable object size from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_SIZE_THRESHOLD"); ok && n > 0 {
