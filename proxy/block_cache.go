@@ -13,13 +13,21 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"golang.org/x/sync/errgroup"
 )
 
 // maxConcurrentBlockFetches bounds how many missing blocks of one request are fetched from
-// upstream concurrently.
-const maxConcurrentBlockFetches = 4
+// upstream concurrently (cache.max_concurrent_block_fetches). A non-positive value — from a
+// config that skipped applyDefaults — would make errgroup admit nothing and hang the request,
+// so it falls back to the default.
+func (s *Service) maxConcurrentBlockFetches() int {
+	if n := s.config.Cache.MaxConcurrentBlockFetches; n > 0 {
+		return n
+	}
+	return config.DefaultCacheMaxConcurrentBlockFetches
+}
 
 // maxRangeBlockFanout caps how many absent blocks a single range read (serve or background
 // populate) will fetch as individual aligned GETs. A footer or row-group read touches only a few
@@ -1332,7 +1340,7 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 		return nil
 	}
 	var g errgroup.Group
-	g.SetLimit(maxConcurrentBlockFetches)
+	g.SetLimit(s.maxConcurrentBlockFetches())
 	var mu sync.Mutex
 	var stale, transient error
 	var canceledAdmission bool
@@ -1599,7 +1607,7 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 // preserves fetchBlocksToCache's stale-signal priority and invalidation rules.
 func (s *Service) fetchBlocksForAssembly(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) (map[int64]*blockFetchLease, error) {
 	var g errgroup.Group
-	g.SetLimit(maxConcurrentBlockFetches)
+	g.SetLimit(s.maxConcurrentBlockFetches())
 	var mu sync.Mutex
 	leases := make(map[int64]*blockFetchLease, len(blockIdxs))
 	var stale, transient error

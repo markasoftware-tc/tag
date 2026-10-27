@@ -49,6 +49,10 @@ const (
 	// each becoming a standalone file (see RFC 0001).
 	DefaultCacheBlockSize = 1 * 1024 * 1024
 
+	// DefaultCacheMaxConcurrentBlockFetches is the default per-request bound on missing blocks
+	// fetched from upstream concurrently.
+	DefaultCacheMaxConcurrentBlockFetches = 4
+
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
 
@@ -361,6 +365,14 @@ type CacheConfig struct {
 	// shared segments. 0 or unset uses DefaultCacheBlockSize (1 MiB). Only meaningful when
 	// BlockCachingEnabled is true.
 	BlockSize int64 `yaml:"block_size"`
+	// MaxConcurrentBlockFetches bounds how many missing blocks of ONE request (a range read
+	// being served, or a background block populate) are fetched from upstream concurrently.
+	// Raising it cuts the upstream round trips a cold multi-block range read waits on before
+	// the response can start, at the cost of more upstream GETs in flight per request. The
+	// process-wide limits (MaxConcurrentWrites, MaxPopulateMemoryBytes) still apply. 0, a
+	// negative value, or unset uses DefaultCacheMaxConcurrentBlockFetches. Only meaningful
+	// when BlockCachingEnabled is true.
+	MaxConcurrentBlockFetches int `yaml:"max_concurrent_block_fetches"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
 	// that warm-on-write populates may reserve ahead of read-miss warms, so
 	// warm-on-write is never starved by the read-miss full-object warm flood. The
@@ -529,6 +541,11 @@ func applyDefaults(cfg *Config) {
 	// falls back to the default.
 	if cfg.Cache.BlockSize <= 0 {
 		cfg.Cache.BlockSize = DefaultCacheBlockSize
+	}
+	// A zero limit would admit no block fetch at all, and there is no safe "unbounded" here,
+	// so any non-positive value falls back to the default.
+	if cfg.Cache.MaxConcurrentBlockFetches <= 0 {
+		cfg.Cache.MaxConcurrentBlockFetches = DefaultCacheMaxConcurrentBlockFetches
 	}
 	if cfg.Cache.DiskPath == "" {
 		cfg.Cache.DiskPath = DefaultCacheDiskPath
@@ -772,6 +789,10 @@ func applyEnvOverrides(cfg *Config) {
 		// Override the block granularity from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {
 			cfg.Cache.BlockSize = n
+		}
+		// Override the per-request block-fetch concurrency from environment (0/unset keeps the default).
+		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_BLOCK_FETCHES"); ok && n > 0 {
+			cfg.Cache.MaxConcurrentBlockFetches = n
 		}
 		// Override the max cacheable object size from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_SIZE_THRESHOLD"); ok && n > 0 {

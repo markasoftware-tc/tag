@@ -526,6 +526,40 @@ func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_MaxConcurrentBlockFetchesDefaultAndOverride(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want int
+	}{
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheMaxConcurrentBlockFetches},
+		{"yaml honored", "cache:\n  enabled: true\n  max_concurrent_block_fetches: 16\n", "", 16},
+		{"env override honored", "cache:\n  enabled: true\n  max_concurrent_block_fetches: 16\n", "32", 32},
+		{"non-positive env ignored", "cache:\n  enabled: true\n  max_concurrent_block_fetches: 16\n", "0", 16},
+		// A zero limit would admit no block fetch, so non-positive YAML takes the default.
+		{"negative yaml defaults", "cache:\n  enabled: true\n  max_concurrent_block_fetches: -1\n", "", DefaultCacheMaxConcurrentBlockFetches},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_MAX_CONCURRENT_BLOCK_FETCHES", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.MaxConcurrentBlockFetches != tc.want {
+				t.Errorf("MaxConcurrentBlockFetches = %d, want %d", cfg.Cache.MaxConcurrentBlockFetches, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_SizeThresholdOverrideByEnv(t *testing.T) {
 	cases := []struct {
 		name string

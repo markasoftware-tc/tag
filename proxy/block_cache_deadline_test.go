@@ -226,6 +226,8 @@ func TestFetchBlocksToCacheStopsAdmissionAfterCancellation(t *testing.T) {
 	cfg.Cache.BlockSize = blockSize
 	cfg.Cache.SizeThreshold = int64(len(object))
 	cfg.Cache.MaxConcurrentWrites = blockCount * 2
+	// A non-default limit so the first wave proves the configured value is honored.
+	cfg.Cache.MaxConcurrentBlockFetches = 8
 	cfg.Cache.MaxPopulateMemoryBytes = 1 << 20
 	store := cache.NewCacheWithClient(probeClient, &cfg.Cache)
 	svc := NewService(forwarder, store, cfg)
@@ -263,19 +265,20 @@ func TestFetchBlocksToCacheStopsAdmissionAfterCancellation(t *testing.T) {
 		waitForBlockFetchDrain(t, svc, forwarder)
 	})
 
-	waitForBlockFetchStart(t, forwarder, maxConcurrentBlockFetches, ctx)
+	limit := svc.maxConcurrentBlockFetches()
+	waitForBlockFetchStart(t, forwarder, limit, ctx)
 	before := snapshotBlockFetchAdmission(svc, probeClient, forwarder)
-	if got := len(before.states); got != maxConcurrentBlockFetches {
-		t.Fatalf("first wave created %d block states, want %d", got, maxConcurrentBlockFetches)
+	if got := len(before.states); got != limit {
+		t.Fatalf("first wave created %d block states, want %d", got, limit)
 	}
-	if got := len(before.probes); got != maxConcurrentBlockFetches {
-		t.Fatalf("first wave made %d block cache probes, want %d", got, maxConcurrentBlockFetches)
+	if got := len(before.probes); got != limit {
+		t.Fatalf("first wave made %d block cache probes, want %d", got, limit)
 	}
-	if got := len(before.gets); got != maxConcurrentBlockFetches {
-		t.Fatalf("first wave started %d upstream GETs, want %d", got, maxConcurrentBlockFetches)
+	if got := len(before.gets); got != limit {
+		t.Fatalf("first wave started %d upstream GETs, want %d", got, limit)
 	}
-	if before.slots != maxConcurrentBlockFetches || before.bytesUsed != int64(maxConcurrentBlockFetches)*blockSize {
-		t.Fatalf("first wave populate permits = (slots=%d bytes=%d), want (%d slots, %d bytes)", before.slots, before.bytesUsed, maxConcurrentBlockFetches, int64(maxConcurrentBlockFetches)*blockSize)
+	if before.slots != limit || before.bytesUsed != int64(limit)*blockSize {
+		t.Fatalf("first wave populate permits = (slots=%d bytes=%d), want (%d slots, %d bytes)", before.slots, before.bytesUsed, limit, int64(limit)*blockSize)
 	}
 
 	// Start cancellation only after the first wave is synchronized at upstream.
@@ -315,11 +318,11 @@ func TestFetchBlocksToCacheStopsAdmissionAfterCancellation(t *testing.T) {
 		t.Errorf("post-cancellation block admission: canceled_at=%s before@%s(states=%d probes=%d GETs=%d slots=%d bytes=%d) after@%s(states=%d probes=%d GETs=%d slots=%d bytes=%d) new_states=%d late_probes=%d[%s..%s] late_GETs=%d[%s..%s] result=%v", canceledAt, before.at, len(before.states), len(before.probes), len(before.gets), before.slots, before.bytesUsed, after.at, len(after.states), len(after.probes), len(after.gets), after.slots, after.bytesUsed, newStates, lateProbes, firstLateProbe, lastLateProbe, lateGets, firstLateGet, lastLateGet, fetchErr)
 	}
 
-	// The four states admitted before cancellation are intentionally detached from the
+	// The states admitted before cancellation are intentionally detached from the
 	// batch context; after upstream is released they still finish their cache writes.
 	release()
 	waitForBlockFetchDrain(t, svc, forwarder)
-	for i := 0; i < maxConcurrentBlockFetches; i++ {
+	for i := 0; i < limit; i++ {
 		if !store.BlockExists(context.Background(), meta.Bucket, meta.Key, meta.ETag, blockSize, int64(i)) {
 			t.Errorf("pre-cancellation admitted block %d did not complete its detached cache write", i)
 		}
